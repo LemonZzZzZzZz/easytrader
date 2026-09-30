@@ -5,9 +5,11 @@ from easytrader import exceptions
 from easytrader.api import use, follower
 from easytrader.exceptions import (
     CircuitBreakerOpenError,
+    HumanInterventionRequiredError,
     SchemaValidationError,
     TradeError,
     TradeVerificationError,
+    VisualArbitrationError,
 )
 from easytrader.log import logger
 

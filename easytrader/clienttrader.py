@@ -15,7 +15,11 @@ from pywinauto import findwindows, timings
 
 from easytrader import grid_strategies, pop_dialog_handler, refresh_strategies
 from easytrader.config import client
-from easytrader.exceptions import TradeError, TradeVerificationError
+from easytrader.exceptions import (
+    HumanInterventionRequiredError,
+    TradeError,
+    TradeVerificationError,
+)
 from easytrader.grid_strategies import IGridStrategy
 from easytrader.log import logger
 from easytrader.refresh_strategies import IRefreshStrategy
@@ -393,6 +397,7 @@ class ClientTrader(IClientTrader):
         self._switch_left_menus(["撤单[F3]"])
 
         # 点击全部撤销控件
+        clicked_cancel_all = False
         try:
             btn_cancel_all = self._app.top_window().child_window(
                 control_id=self._config.TRADE_CANCEL_ALL_ENTRUST_CONTROL_ID,
@@ -401,8 +406,20 @@ class ClientTrader(IClientTrader):
             )
             if btn_cancel_all.exists(timeout=1):
                 btn_cancel_all.click()
+                clicked_cancel_all = True
         except Exception as e:
             logger.warning("点击全撤按钮异常: %s", e)
+
+        # 针对券商换肤版无句柄“全撤”图标，通过 VLM 视觉 Grounding 定位并点击
+        if not clicked_cancel_all and getattr(self, "visual_oracle", None) is not None:
+            try:
+                screen_img = self._capture_screen_image()
+                ground_res = self.visual_oracle.ground_control(screen_img, "全撤")
+                if ground_res.found and ground_res.center:
+                    self._click_coords(ground_res.center, window=self._main)
+                    clicked_cancel_all = True
+            except Exception as ex:
+                logger.warning("视觉定位全撤按钮异常: %s", ex)
         self.wait(0.2)
 
         # 等待出现确认对话框并重试点击
@@ -661,11 +678,61 @@ class ClientTrader(IClientTrader):
     def trade(self, security, price, amount):
         self._set_trade_params(security, price, amount)
 
+        # 针对早盘高并发无回执阶段，在下单提交前预先抓取操作区双帧的前帧 (frame_before)
+        frame_before = None
+        if getattr(self, "visual_oracle", None) is not None:
+            try:
+                frame_before = self._capture_screen_image()
+            except Exception as e:
+                logger.debug("Pre-trade frame capture fallback: %s", e)
+
         self._submit_trade()
 
-        return self._handle_pop_dialogs(
+        res = self._handle_pop_dialogs(
             handler_class=pop_dialog_handler.TradePopDialogHandler
         )
+        if getattr(self, "visual_oracle", None) is not None:
+            try:
+                screen_img = self._capture_screen_image()
+                toast_res = self.visual_oracle.verify_status_bar_and_toast(screen_img)
+                if toast_res.is_rejected:
+                    raise TradeError(f"交易废单拒绝: {toast_res.reject_reason or toast_res.message}")
+                if toast_res.entrust_no:
+                    if isinstance(res, dict):
+                        res["entrust_no"] = toast_res.entrust_no
+                if toast_res.message and isinstance(res, dict) and "success" in str(res.get("message", "")):
+                    res["message"] = toast_res.message
+
+                # R3 落地：若未从 Toast/状态栏获取到明确的合同编号且已捕获下单前帧，或显式启用了双帧仲裁
+                # 执行双帧差分仲裁，防范早盘高并发无回执阶段重复挂单与穿仓
+                if frame_before is not None and (
+                    not (isinstance(res, dict) and res.get("entrust_no"))
+                    or getattr(self.visual_oracle, "enable_dual_frame", False)
+                ):
+                    from easytrader.vlm_visual_oracle import ArbitrationDecision
+
+                    diff_res = self.visual_oracle.arbitrate_trade_receipt(
+                        frame_before=frame_before,
+                        frame_after=screen_img,
+                    )
+                    if diff_res.decision == ArbitrationDecision.SUBMIT_FAILED:
+                        raise TradeError(f"双帧视觉仲裁判定下单失败: {'; '.join(diff_res.reasons)}")
+                    if isinstance(res, dict):
+                        res["visual_decision"] = diff_res.decision
+                        res["visual_confidence"] = diff_res.confidence
+                        res["suggested_action"] = diff_res.suggested_action
+                        if diff_res.decision == ArbitrationDecision.AMBIGUOUS:
+                            res["ambiguous"] = True
+                            res["reasons"] = diff_res.reasons
+                            if res.get("message") == "success":
+                                res["message"] = (
+                                    "ambiguous: order submission unconfirmed by visual diff, please query today entrusts"
+                                )
+            except TradeError:
+                raise
+            except Exception as e:
+                logger.debug("Visual status bar/toast/dual-frame verification fallback: %s", e)
+        return res
 
     def _click(self, control_id):
         self._app.top_window().child_window(
@@ -760,7 +827,30 @@ class ClientTrader(IClientTrader):
     @perf_clock
     def _switch_left_menus(self, path, sleep=0.2):
         self.close_pop_dialog()
-        self._get_left_menus_handle().get_item(path).select()
+        try:
+            self._get_left_menus_handle().get_item(path).select()
+        except Exception as e:
+            # 针对自绘折叠菜单树或无句柄树控件，回退至视觉 Grounding 定位
+            if getattr(self, "visual_oracle", None) is not None:
+                target_name = path[-1] if isinstance(path, (list, tuple)) else str(path)
+                screen_img = self._capture_screen_image()
+                ground_res = self.visual_oracle.ground_control(screen_img, target_name)
+                if ground_res.found and ground_res.center:
+                    self._click_coords(ground_res.center, window=self._main)
+                elif isinstance(path, (list, tuple)) and len(path) > 1:
+                    # 折叠状态下目标子项未展示，依次展开父级菜单层级
+                    for item_name in path:
+                        step_img = self._capture_screen_image()
+                        step_res = self.visual_oracle.ground_control(step_img, str(item_name))
+                        if step_res.found and step_res.center:
+                            self._click_coords(step_res.center, window=self._main)
+                            self.wait(0.2)
+                        else:
+                            raise
+                else:
+                    raise
+            else:
+                raise
         self._app.top_window().type_keys('{F5}')
         self.wait(sleep)
 
@@ -787,6 +877,76 @@ class ClientTrader(IClientTrader):
                 logger.exception("error occurred when trying to get left menus")
             count = count - 1
 
+    @property
+    def visual_oracle(self):
+        return getattr(self, "_visual_oracle", None)
+
+    @visual_oracle.setter
+    def visual_oracle(self, oracle):
+        self._visual_oracle = oracle
+
+    def enable_visual_oracle(self, backend=None, enable_dual_frame: bool = False, **kwargs):
+        from easytrader.vlm_visual_oracle import VLMVisualOracle
+        self._visual_oracle = VLMVisualOracle(
+            backend=backend, enable_dual_frame=enable_dual_frame, **kwargs
+        )
+        return self._visual_oracle
+
+    def _capture_window_image(self, window=None):
+        try:
+            target = window if window is not None else self._app.top_window()
+            if hasattr(target, "wrapper_object"):
+                try:
+                    target = target.wrapper_object()
+                except Exception:
+                    pass
+            if hasattr(target, "capture_as_image"):
+                return target.capture_as_image()
+        except Exception:
+            pass
+        from PIL import Image
+        return Image.new("RGB", (400, 300), color="white")
+
+    def _capture_screen_image(self):
+        try:
+            target = self._main
+            if hasattr(target, "wrapper_object"):
+                try:
+                    target = target.wrapper_object()
+                except Exception:
+                    pass
+            if hasattr(target, "capture_as_image"):
+                return target.capture_as_image()
+        except Exception:
+            pass
+        from PIL import Image
+        return Image.new("RGB", (800, 600), color="white")
+
+    def _click_coords(self, coords, window=None):
+        target = window or self._app.top_window()
+        try:
+            target.click_input(coords=coords)
+        except Exception:
+            try:
+                target.click(coords=coords)
+            except Exception as e:
+                logger.debug("Click coords failed: %s", e)
+
+    def _submit_dialog_confirm(self):
+        w = self._app.top_window()
+        for btn_title in ["确定", "是(Y)", "是(&Y)", "确认", "是"]:
+            try:
+                btn = w[btn_title]
+                if btn.exists():
+                    btn.click()
+                    return
+            except Exception:
+                pass
+        try:
+            w.type_keys("%Y", set_foreground=False)
+        except Exception:
+            pass
+
     def _cancel_entrust_by_double_click(self, row):
         scale = self.get_dpi_scale_factor()
         x = int(self._config.CANCEL_ENTRUST_GRID_LEFT_MARGIN * scale)
@@ -797,6 +957,32 @@ class ClientTrader(IClientTrader):
             )
             * scale
         )
+        if getattr(self, "visual_oracle", None) is not None:
+            try:
+                grid_ctrl = self._app.top_window().child_window(
+                    control_id=self._config.COMMON_GRID_CONTROL_ID,
+                    class_name="CVirtualGridCtrl",
+                )
+                wrapper = grid_ctrl
+                if hasattr(grid_ctrl, "wrapper_object"):
+                    try:
+                        wrapper = grid_ctrl.wrapper_object()
+                    except Exception:
+                        pass
+                if hasattr(wrapper, "capture_as_image"):
+                    grid_img = wrapper.capture_as_image()
+                    calibrated = self.visual_oracle.calibrate_grid_row(
+                        grid_image=grid_img,
+                        target_row=row,
+                        nominal_x=x,
+                        nominal_y=y,
+                        first_row_height=int(self._config.CANCEL_ENTRUST_GRID_FIRST_ROW_HEIGHT * scale),
+                        row_height=int(self._config.CANCEL_ENTRUST_GRID_ROW_HEIGHT * scale),
+                    )
+                    y = calibrated.calibrated_y
+            except Exception as e:
+                logger.debug("Visual row calibration fallback: %s", e)
+
         self._app.top_window().child_window(
             control_id=self._config.COMMON_GRID_CONTROL_ID,
             class_name="CVirtualGridCtrl",
@@ -806,19 +992,115 @@ class ClientTrader(IClientTrader):
         self.refresh_strategy.set_trader(self)
         self.refresh_strategy.refresh()
 
+    def _arbitrate_and_dismiss_modal_dialog(self, dialog_img=None):
+        """利用 VLM 对阻断弹窗或 DirectUI 蒙层进行视觉智能仲裁并执行安全闭环操作"""
+        if getattr(self, "visual_oracle", None) is None:
+            raise TradeVerificationError(
+                "未能识别弹窗控件 (ID 1365)，且无法进行视觉仲裁，严禁返回假成功",
+                result={"message": "unhandled_unknown_dialog"},
+            )
+
+        if dialog_img is None:
+            dialog_img = self._capture_window_image(self._app.top_window())
+
+        decision = self.visual_oracle.arbitrate_modal_dialog(dialog_img)
+        if decision.dialog_type == "CAPTCHA" or decision.requires_human:
+            raise HumanInterventionRequiredError(
+                f"检测到图形验证码，触发熔断: {decision.message}"
+            )
+        if decision.action in ("CHECK_AND_WAIT_CONFIRM", "WAIT_AND_CONFIRM"):
+            if decision.has_checkbox and decision.checkbox_coord:
+                self._click_coords(decision.checkbox_coord)
+            if decision.countdown_seconds > 0:
+                self.wait(decision.countdown_seconds + 0.2)
+            if decision.button_coord:
+                self._click_coords(decision.button_coord)
+            else:
+                self._submit_dialog_confirm()
+            self.wait(0.2)
+            return decision
+        elif decision.action == "SKIP":
+            if decision.button_coord:
+                self._click_coords(decision.button_coord)
+            else:
+                self._submit_dialog_confirm()
+            self.wait(0.2)
+            return decision
+        elif decision.action == "RAISE_ERROR":
+            raise TradeError(decision.message)
+        elif decision.action == "CONFIRM":
+            if decision.button_coord:
+                self._click_coords(decision.button_coord)
+            else:
+                self._submit_dialog_confirm()
+            self.wait(0.2)
+            return decision
+        else:
+            raise TradeVerificationError(
+                f"未知阻断弹窗无法闭环: {decision.message}",
+                result={"dialog_type": decision.dialog_type, "message": decision.message},
+            )
+
+    def check_liveness(self, hwnd=None):
+        """非侵入式检查客户端界面存活性与健康状态"""
+        if getattr(self, "visual_oracle", None) is not None:
+            screen_img = self._capture_screen_image()
+            return self.visual_oracle.inspect_liveness(screen_img, hwnd=hwnd, trader=self)
+        from easytrader.vlm_visual_oracle import LivenessReport
+        return LivenessReport(is_alive=True, state="HEALTHY")
+
     @perf_clock
     def _handle_pop_dialogs(self, handler_class=pop_dialog_handler.PopDialogHandler):
         handler = handler_class(self._app)
+        max_attempts = 10
+        attempt = 0
 
         while self.is_exist_pop_dialog():
+            attempt += 1
+            if attempt > max_attempts:
+                raise TradeVerificationError(
+                    f"处理弹窗超过最大尝试次数 ({max_attempts})，防止无限循环",
+                    result={"message": "dialog_dismiss_timeout"},
+                )
+
+            title = None
             try:
                 title = self._get_pop_dialog_title()
-            except pywinauto.findwindows.ElementNotFoundError:
-                return {"message": "success"}
+            except (pywinauto.findwindows.ElementNotFoundError, Exception):
+                self._arbitrate_and_dismiss_modal_dialog()
+                continue
 
-            result = handler.handle(title)
-            if result:
+            # 若标题存在，先尝试交给 handler 处理
+            result = None
+            try:
+                result = handler.handle(title)
+            except Exception as e:
+                # 弹窗内控件缺失或非标弹窗抛出异常，回退至视觉智能仲裁
+                if getattr(self, "visual_oracle", None) is not None:
+                    self._arbitrate_and_dismiss_modal_dialog()
+                    continue
+                raise
+
+            if result and not ("unknown message" in str(result.get("message", ""))):
                 return result
+
+            # 若 handler 返回 None 或 unknown message，且启用了 visual_oracle，执行视觉智能仲裁闭环
+            if getattr(self, "visual_oracle", None) is not None:
+                self._arbitrate_and_dismiss_modal_dialog()
+                continue
+
+        # 当 is_exist_pop_dialog() 为 False 时（例如闪电交易或 DirectUI 页面内蒙层遮罩）：
+        # 若启用了 visual_oracle，进行视觉存活性与全屏蒙层巡检，防止 DirectUI 蒙层静默假成功
+        if getattr(self, "visual_oracle", None) is not None:
+            screen_img = self._capture_screen_image()
+            liveness = self.visual_oracle.inspect_liveness(screen_img, trader=self)
+            if liveness.state == "MASK_LOCKED":
+                self._arbitrate_and_dismiss_modal_dialog(dialog_img=screen_img)
+            elif liveness.state in ("BLACK_SCREEN", "MESSAGE_PUMP_HUNG", "OFFLINE"):
+                raise TradeError(
+                    f"客户端视觉状态异常 [{liveness.state}]: {'; '.join(liveness.issues)}"
+                )
+
         return {"message": "success"}
 
 
