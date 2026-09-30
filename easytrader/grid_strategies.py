@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import abc
 import io
+import os
+import re
 import tempfile
 from io import StringIO
 from typing import TYPE_CHECKING, Dict, List, Optional
@@ -109,19 +111,23 @@ class Copy(BaseStrategy):
         return self._format_grid_data(content)
 
     def _format_grid_data(self, data: str) -> List[Dict]:
+        if not data or not data.strip():
+            return []
         try:
-            if not data or not data.strip():
-                return []
+            dtype = self._trader.config.GRID_DTYPE if self._trader and hasattr(self._trader, "config") else None
             df = pd.read_csv(
                 io.StringIO(data),
                 delimiter="\t",
-                dtype=self._trader.config.GRID_DTYPE,
+                dtype=dtype,
                 na_filter=False,
             )
-            return self._filter_summary_rows(df.to_dict("records"))
-        except Exception:
-            Copy._need_captcha_reg = True
+        except pd.errors.EmptyDataError:
             return []
+        except Exception as e:
+            Copy._need_captcha_reg = True
+            logger.warning("解析剪贴板表格数据异常: %s", e)
+            raise
+        return self._filter_summary_rows(df.to_dict("records"))
 
     def _get_clipboard_data(self) -> str:
         if Copy._need_captcha_reg:
@@ -170,13 +176,16 @@ class Copy(BaseStrategy):
                 # 不要将 Copy._need_captcha_reg 置为 False, 因为它是类方法, 一旦置为 False, 后续操作都不再进行验证码识别
                 # Copy._need_captcha_reg = False
         count = 5
+        last_error = None
         while count > 0:
             try:
                 return pywinauto.clipboard.GetData()
             # pylint: disable=broad-except
             except Exception as e:
+                last_error = e
                 count -= 1
                 logger.exception("%s, retry ......", e)
+        raise IOError(f"获取剪贴板数据失败: {last_error}") from last_error
 
 
 class WMCopy(Copy):
@@ -230,26 +239,34 @@ class Xls(BaseStrategy):
             self._trader.app.top_window().Button2.click()
             self._trader.wait(0.2)
 
-        return self._format_grid_data(temp_path)
+        try:
+            return self._format_grid_data(temp_path)
+        finally:
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except Exception:
+                    pass
 
     def _format_grid_data(self, data: str) -> List[Dict]:
+        with open(data, encoding="gbk", errors="replace") as f:
+            content = f.read()
+
+        if not content or not content.strip():
+            return []
+
         try:
-            with open(data, encoding="gbk", errors="replace") as f:
-                content = f.read()
-
-            if not content or not content.strip():
-                return []
-
+            dtype = self._trader.config.GRID_DTYPE if self._trader and hasattr(self._trader, "config") else None
             df = pd.read_csv(
                 StringIO(content),
                 delimiter="\t",
-                dtype=self._trader.config.GRID_DTYPE,
+                dtype=dtype,
                 na_filter=False,
             )
-            return self._filter_summary_rows(df.to_dict("records"))
-        except Exception as e:
-            logger.warning("解析表格文件失败: %s", e)
+        except pd.errors.EmptyDataError:
             return []
+
+        return self._filter_summary_rows(df.to_dict("records"))
 
 
 class ScreenshotOCR(BaseStrategy):
@@ -285,7 +302,8 @@ class ScreenshotOCR(BaseStrategy):
 
     def _parse_image_records(self, img) -> List[Dict]:
         """
-        利用 OCR 结果根据空间几何坐标重组表格行列
+        利用 OCR 结果根据空间几何坐标重组表格行列，
+        基于表头物理列区间进行投影对齐，杜绝错位塌陷与数值粘连
         """
         engine = self._get_ocr_engine()
         import numpy as np
@@ -300,45 +318,221 @@ class ScreenshotOCR(BaseStrategy):
             text = str(text).strip()
             if not text:
                 continue
-            cy = sum(p[1] for p in box) / 4.0
-            cx = sum(p[0] for p in box) / 4.0
-            h = abs(box[2][1] - box[0][1])
-            items.append({"text": text, "cx": cx, "cy": cy, "h": h, "box": box})
+            num_pts = float(len(box)) if box else 0.0
+            if num_pts == 0.0:
+                continue
+            cy = sum(p[1] for p in box) / num_pts
+            cx = sum(p[0] for p in box) / num_pts
+            x_min = min(p[0] for p in box)
+            x_max = max(p[0] for p in box)
+            y_min = min(p[1] for p in box)
+            y_max = max(p[1] for p in box)
+            h = abs(y_max - y_min)
+            w = abs(x_max - x_min)
+            items.append({
+                "text": text,
+                "cx": cx,
+                "cy": cy,
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min,
+                "y_max": y_max,
+                "h": h,
+                "w": w,
+                "box": box,
+            })
 
         if not items:
             return []
 
         avg_h = sum(it["h"] for it in items) / len(items) if items else 16.0
-        line_threshold = max(avg_h * 0.6, 8.0)
+        line_threshold = max(avg_h * 0.45, 6.0)
 
         items_sorted_y = sorted(items, key=lambda x: x["cy"])
         rows = []
         current_row = [items_sorted_y[0]]
-        current_cy = items_sorted_y[0]["cy"]
 
         for it in items_sorted_y[1:]:
-            if abs(it["cy"] - current_cy) < line_threshold:
+            row_y_min = min(x["y_min"] for x in current_row)
+            row_y_max = max(x["y_max"] for x in current_row)
+            row_cy = sum(x["cy"] for x in current_row) / len(current_row)
+            row_h = max(row_y_max - row_y_min, 1.0)
+            overlap = min(it["y_max"], row_y_max) - max(it["y_min"], row_y_min)
+            min_h = min(it["h"], row_h)
+            overlap_ratio = overlap / min_h if min_h > 0 else 0
+
+            # 属于同行的条件：垂直投影重叠比例大于 35% 或 (垂直重叠 > 0 且中心点纵坐标偏差在行阈值内)
+            if (overlap_ratio >= 0.35) or (abs(it["cy"] - row_cy) < line_threshold and overlap > 0):
                 current_row.append(it)
             else:
                 rows.append(sorted(current_row, key=lambda x: x["cx"]))
                 current_row = [it]
-                current_cy = it["cy"]
         if current_row:
             rows.append(sorted(current_row, key=lambda x: x["cx"]))
 
         if len(rows) < 2:
             return []
 
-        headers = [it["text"] for it in rows[0]]
+        def _split_concatenated_floats(text):
+            # 排除标准日期格式（如 2026.09.30），严禁误拆日期
+            if re.match(r"^\d{4}[./-]\d{1,2}[./-]\d{1,2}$", text):
+                return [text.strip()]
+
+            dot_indices = [i for i, ch in enumerate(text) if ch == "."]
+            if len(dot_indices) < 2:
+                return [text.strip()]
+
+            d0 = dot_indices[0]
+            d1 = dot_indices[1]
+
+            candidates = []
+            expected_ratio = 1.0 / len(dot_indices)
+            for p in range(d0 + 2, d1):
+                s1 = text[:p].strip()
+                s2 = text[p:].strip()
+                try:
+                    float(s1.replace(",", ""))
+                except ValueError:
+                    continue
+
+                int1 = s1.replace(",", "").split(".")[0].strip().lstrip("-+")
+                if int1.startswith("0") and len(int1) > 1:
+                    continue
+
+                int2 = text[p:d1].strip().lstrip("-+").replace(",", "")
+                if not int2 or not int2.isdigit() or (int2.startswith("0") and len(int2) > 1):
+                    continue
+
+                dec1_len = len(s1.replace(",", "").split(".")[1])
+                dec_penalty = 0
+                if dec1_len not in (2, 3):
+                    dec_penalty += 1
+
+                if len(dot_indices) == 2:
+                    try:
+                        float(s2.replace(",", ""))
+                        dec2_len = len(s2.replace(",", "").split(".")[1])
+                        if dec2_len not in (2, 3):
+                            dec_penalty += 1
+                    except ValueError:
+                        continue
+
+                ratio_dist = abs(p / len(text) - expected_ratio)
+                candidates.append((dec_penalty, ratio_dist, s1, s2))
+
+            if candidates:
+                candidates.sort(key=lambda c: (c[0], c[1]))
+                best_s1 = candidates[0][2]
+                best_s2 = candidates[0][3]
+                rest = _split_concatenated_floats(best_s2)
+                return [best_s1] + rest
+
+            return [text.strip()]
+
+        def _make_sub_items(item, parts):
+            parts = [p.strip() for p in parts if p.strip()]
+            total_len = sum(len(p) for p in parts)
+            if total_len == 0 or len(parts) <= 1:
+                return [item]
+            sub_items = []
+            curr_x = item["x_min"]
+            total_w = item["x_max"] - item["x_min"]
+            for p in parts:
+                part_w = total_w * (len(p) / total_len)
+                p_min = curr_x
+                p_max = curr_x + part_w
+                p_cx = (p_min + p_max) / 2.0
+                curr_x = p_max
+                sub_items.append({
+                    "text": p,
+                    "cx": p_cx,
+                    "cy": item["cy"],
+                    "x_min": p_min,
+                    "x_max": p_max,
+                    "y_min": item["y_min"],
+                    "y_max": item["y_max"],
+                    "h": item["h"],
+                    "w": p_max - p_min,
+                    "box": [[p_min, item["y_min"]], [p_max, item["y_min"]], [p_max, item["y_max"]], [p_min, item["y_max"]]],
+                })
+            return sub_items
+
+        def _decompose_adhered_item(item):
+            # 1. 优先按任意空白字符（空格、制表符等）切分多子段
+            raw_text = item["text"]
+            parts = [p.strip() for p in raw_text.split() if p.strip()]
+            if len(parts) > 1:
+                sub_items = _make_sub_items(item, parts)
+            else:
+                sub_items = [item]
+
+            # 2. 级联检查各子元素是否存在多个浮点数数值粘连（如 13.15413.150 或三连浮点数）
+            final_items = []
+            for sub in sub_items:
+                if sub["text"].count(".") >= 2:
+                    f_parts = _split_concatenated_floats(sub["text"])
+                    if len(f_parts) > 1:
+                        final_items.extend(_make_sub_items(sub, f_parts))
+                    else:
+                        final_items.append(sub)
+                else:
+                    final_items.append(sub)
+
+            return final_items
+
+        # 表头物理列区间分析（级联分解表头粘连多列）
+        expanded_header_items = []
+        for it in rows[0]:
+            expanded_header_items.extend(_decompose_adhered_item(it))
+        header_items = sorted(expanded_header_items, key=lambda x: x["cx"])
+        headers = [it["text"] for it in header_items]
+        num_cols = len(headers)
+        if num_cols == 0:
+            return []
+
+        # 计算各列物理分界线（相邻表头中心点中值）及表格左右边界保护
+        boundaries = []
+        for i in range(num_cols - 1):
+            mid = (header_items[i]["cx"] + header_items[i + 1]["cx"]) / 2.0
+            boundaries.append(mid)
+
+        if num_cols > 1:
+            left_bound = min(header_items[0]["cx"] - (header_items[1]["cx"] - header_items[0]["cx"]) / 2.0, header_items[0]["x_min"] - 10.0)
+            right_bound = max(header_items[-1]["cx"] + (header_items[-1]["cx"] - header_items[-2]["cx"]) / 2.0, header_items[-1]["x_max"] + 10.0)
+        else:
+            left_bound = header_items[0]["x_min"] - 20.0
+            right_bound = header_items[0]["x_max"] + 20.0
+
+        def _get_col_index(cx):
+            if cx < left_bound or cx > right_bound:
+                return -1
+            for k, b in enumerate(boundaries):
+                if cx < b:
+                    return k
+            return len(boundaries)
+
         data_records = []
         for r in rows[1:]:
-            record = {}
-            for col_idx, cell in enumerate(r):
-                if col_idx < len(headers):
-                    record[headers[col_idx]] = cell["text"]
-                else:
-                    record[f"col_{col_idx}"] = cell["text"]
-            if record:
+            expanded_cells = []
+            for cell in r:
+                expanded_cells.extend(_decompose_adhered_item(cell))
+
+            # 几何物理投影：初始化全部表头列为空字符串，缺失单元格为空
+            record = {h: "" for h in headers}
+            col_assigned = {k: [] for k in range(num_cols)}
+
+            for cell in expanded_cells:
+                col_idx = _get_col_index(cell["cx"])
+                if 0 <= col_idx < num_cols:
+                    col_assigned[col_idx].append(cell)
+
+            for col_idx, h in enumerate(headers):
+                cells_in_col = col_assigned[col_idx]
+                if cells_in_col:
+                    cells_in_col.sort(key=lambda c: c["cx"])
+                    record[h] = "".join(c["text"].strip() for c in cells_in_col).strip()
+
+            if any(v != "" for v in record.values()):
                 data_records.append(record)
 
         return data_records

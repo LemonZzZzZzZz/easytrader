@@ -244,14 +244,14 @@ class TestGridDataFormatting(unittest.TestCase):
         self.assertEqual(result_whitespace, [])
 
     def test_copy_format_grid_data_malformed(self):
-        """测试异常损坏数据触发捕获并重置 _need_captcha_reg 且安全返回空列表 []"""
+        """测试异常损坏数据触发捕获并重置 _need_captcha_reg 且显式抛出异常"""
         copy_strategy = Copy()
         copy_strategy.set_trader(self.trader)
 
         Copy._need_captcha_reg = False
         with patch("pandas.read_csv", side_effect=Exception("Malformed TSV")):
-            result = copy_strategy._format_grid_data("some corrupt text")
-            self.assertEqual(result, [])
+            with self.assertRaises(Exception):
+                copy_strategy._format_grid_data("some corrupt text")
             self.assertTrue(Copy._need_captcha_reg)
 
     def test_xls_format_grid_data_success(self):
@@ -312,12 +312,29 @@ class TestGridDataFormatting(unittest.TestCase):
                 os.remove(temp_path)
 
     def test_xls_format_grid_data_corrupted_file(self):
-        """测试 Xls 策略遇到不可读取或损坏文件时捕获异常并返回空列表 []"""
+        """测试 Xls 策略遇到不可读取或损坏文件时明确抛出异常而非返回空列表 []"""
         xls_strategy = Xls()
         xls_strategy.set_trader(self.trader)
 
-        result = xls_strategy._format_grid_data("non_existing_file_path_12345.xls")
-        self.assertEqual(result, [])
+        with self.assertRaises(Exception):
+            xls_strategy._format_grid_data("non_existing_file_path_12345.xls")
+
+    def test_xls_format_grid_data_corrupted_format(self):
+        """测试 Xls 策略遇到格式损坏或无法解析的文件内容时抛出 ParserError 异常"""
+        xls_strategy = Xls()
+        xls_strategy.set_trader(self.trader)
+
+        with tempfile.NamedTemporaryFile("w", encoding="gbk", delete=False, suffix=".xls") as f:
+            f.write("a\tb\n1\t2\t3\t4\n")
+            temp_path = f.name
+
+        try:
+            with patch("pandas.read_csv", side_effect=pd.errors.ParserError("Corrupted TSV")):
+                with self.assertRaises(pd.errors.ParserError):
+                    xls_strategy._format_grid_data(temp_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
 
 
 class TestBalanceParsing(unittest.TestCase):
@@ -878,7 +895,7 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
                             self.assertEqual(res["entrust_no"], "123456")
 
     def test_cancel_entrust_unconfirmed_when_timeout(self):
-        """测试撤单后在规定时间内未从撤单列表消失返回 unconfirmed 警告"""
+        """测试撤单后在规定时间内未从撤单列表消失抛出 TradeVerificationError 异常"""
         fake_entrusts_still_present = [
             {"合同编号": "123456", "证券代码": "000001"},
         ]
@@ -892,9 +909,80 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
                             new_callable=PropertyMock,
                             return_value=fake_entrusts_still_present,
                         ):
-                            res = self.trader.cancel_entrust("123456", verify_timeout=0.1)
-                            self.assertEqual(res["message"], "unconfirmed")
-                            self.assertFalse(res["verified"])
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                            self.assertIn("123456", str(ctx.exception))
+
+    def test_cancel_entrust_empty_grid_during_verify_raises_verification_error(self):
+        """测试撤单二次核对期间若表格返回 [] 严禁判定成功，必须触发 TradeVerificationError"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        fake_entrusts_after = []
+
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok"}):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, fake_entrusts_after],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                            self.assertIn("待撤列表为空", str(ctx.exception))
+
+    def test_cancel_entrust_grid_exception_during_verify_raises_verification_error(self):
+        """测试撤单二次核对期间若网格读取抛出系统异常，必须触发 TradeVerificationError"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok"}):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, IOError("Grid read failed")],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                            self.assertIn("Grid read failed", str(ctx.exception))
+
+    def test_cancel_entrust_recovers_from_transient_error_and_reports_timeout(self):
+        """测试撤单二次核对期间若发生瞬态网格异常但随后恢复，超时后应准确报告超时而非历史瞬态异常"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        # 第一次异常，第二次成功读取但订单仍在待撤列表中
+        fake_entrusts_still_present = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok"}):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, IOError("Transient grid error"), fake_entrusts_still_present],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.5)
+                            # 验证异常信息报告的是超时未移除，而非历史瞬态异常
+                            self.assertIn("未能在", str(ctx.exception))
+                            self.assertNotIn("Transient grid error", str(ctx.exception))
 
     def test_screenshot_ocr_missing_dependency(self):
         """测试未安装 rapidocr 时 ScreenshotOCR 策略友好报错"""
@@ -936,6 +1024,471 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
             self.assertEqual(records[0]["证券名称"], "金石亚药")
             self.assertEqual(records[0]["股票余额"], "100")
 
+    def test_screenshot_ocr_missing_cell_physical_projection(self):
+        """测试当表头 7 列但数据行缺失 1 列时，缺失列为空且后续列绝不发生左移塌陷"""
+        mock_ocr_result = [
+            # 7 列表头
+            [[[10, 0], [50, 0], [50, 20], [10, 20]], "证券代码", 0.99],   # cx=30
+            [[[60, 0], [120, 0], [120, 20], [60, 20]], "证券名称", 0.99],  # cx=90
+            [[[130, 0], [180, 0], [180, 20], [130, 20]], "股票余额", 0.99], # cx=155
+            [[[190, 0], [240, 0], [240, 20], [190, 20]], "可用余额", 0.99], # cx=215
+            [[[250, 0], [300, 0], [300, 20], [250, 20]], "成本价", 0.99],   # cx=275
+            [[[310, 0], [360, 0], [360, 20], [310, 20]], "当前价", 0.99],   # cx=335
+            [[[370, 0], [420, 0], [420, 20], [370, 20]], "浮动盈亏", 0.99], # cx=395
+
+            # 数据行：缺失 成本价 (cx=275)，共 6 个单元格
+            [[[10, 30], [50, 30], [50, 50], [10, 50]], "600519", 0.99],
+            [[[60, 30], [120, 30], [120, 50], [60, 50]], "贵州茅台", 0.99],
+            [[[130, 30], [180, 30], [180, 50], [130, 50]], "100", 0.99],
+            [[[190, 30], [240, 30], [240, 50], [190, 50]], "100", 0.99],
+            # 成本价缺失！
+            [[[310, 30], [360, 30], [360, 50], [310, 50]], "1800.00", 0.99],
+            [[[370, 30], [420, 30], [420, 50], [370, 50]], "250.00", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            row = records[0]
+            self.assertEqual(row["证券代码"], "600519")
+            self.assertEqual(row["证券名称"], "贵州茅台")
+            self.assertEqual(row["股票余额"], "100")
+            self.assertEqual(row["可用余额"], "100")
+            self.assertEqual(row["成本价"], "")  # 缺失单元格为空
+            self.assertEqual(row["当前价"], "1800.00")  # 绝不塌陷到成本价
+            self.assertEqual(row["浮动盈亏"], "250.00")
+
+    def test_screenshot_ocr_numerical_adhesion(self):
+        """测试当 OCR 识别出跨列数值粘连（如 13.15413.150）时能基于几何物理区间正确分解对齐"""
+        mock_ocr_result = [
+            # 表头：证券代码、证券名称、股票余额、成本价、当前价
+            [[[10, 0], [50, 0], [50, 20], [10, 20]], "证券代码", 0.99],   # cx=30
+            [[[60, 0], [120, 0], [120, 20], [60, 20]], "证券名称", 0.99],  # cx=90
+            [[[130, 0], [180, 0], [180, 20], [130, 20]], "股票余额", 0.99], # cx=155
+            [[[190, 0], [250, 0], [250, 20], [190, 20]], "成本价", 0.99],   # cx=220
+            [[[260, 0], [320, 0], [320, 20], [260, 20]], "当前价", 0.99],   # cx=290
+
+            # 数据行：成本价与当前价粘连为单个框 13.15413.150 (跨越 x=190 到 x=320)
+            [[[10, 30], [50, 30], [50, 50], [10, 50]], "000001", 0.99],
+            [[[60, 30], [120, 30], [120, 50], [60, 50]], "平安银行", 0.99],
+            [[[130, 30], [180, 30], [180, 50], [130, 50]], "500", 0.99],
+            [[[195, 30], [315, 30], [315, 50], [195, 50]], "13.15413.150", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            row = records[0]
+            self.assertEqual(row["证券代码"], "000001")
+            self.assertEqual(row["证券名称"], "平安银行")
+            self.assertEqual(row["股票余额"], "500")
+            self.assertEqual(row["成本价"], "13.154")
+            self.assertEqual(row["当前价"], "13.150")
+
+    def test_screenshot_ocr_space_adhesion_compact_columns(self):
+        """测试紧凑列中带空格粘连的多数值正确分配至相邻列"""
+        mock_ocr_result = [
+            [[[10, 0], [50, 0], [50, 20], [10, 20]], "买入价", 0.99],  # cx=30
+            [[[60, 0], [100, 0], [100, 20], [60, 20]], "卖出价", 0.99], # cx=80
+
+            # 数据行：粘连为 "10.50 10.55"
+            [[[15, 30], [95, 30], [95, 50], [15, 50]], "10.50 10.55", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["买入价"], "10.50")
+            self.assertEqual(records[0]["卖出价"], "10.55")
+
+    def test_screenshot_ocr_mixed_space_and_concatenated_floats(self):
+        """测试单个 OCR 框中同时包含空格与数值粘连（如 '500 13.15413.150'）时的两阶段级联分解"""
+        mock_ocr_result = [
+            # 3 列表头：股票余额, 成本价, 当前价
+            [[[10, 0], [60, 0], [60, 20], [10, 20]], "股票余额", 0.99],   # cx=35
+            [[[70, 0], [130, 0], [130, 20], [70, 20]], "成本价", 0.99],   # cx=100
+            [[[140, 0], [200, 0], [200, 20], [140, 20]], "当前价", 0.99], # cx=170
+
+            # 数据行：1 个粘连框跨越 3 列
+            [[[15, 30], [195, 30], [195, 50], [15, 50]], "500 13.15413.150", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            row = records[0]
+            self.assertEqual(row["股票余额"], "500")
+            self.assertEqual(row["成本价"], "13.154")
+            self.assertEqual(row["当前价"], "13.150")
+
+    def test_screenshot_ocr_tab_separated_adhesion(self):
+        """测试包含制表符等非空格空白字符的单元格粘连分解"""
+        mock_ocr_result = [
+            [[[10, 0], [60, 0], [60, 20], [10, 20]], "股票余额", 0.99],   # cx=35
+            [[[70, 0], [130, 0], [130, 20], [70, 20]], "可用余额", 0.99], # cx=100
+            [[[15, 30], [125, 30], [125, 50], [15, 50]], "100\t200", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["股票余额"], "100")
+            self.assertEqual(records[0]["可用余额"], "200")
+
+    def test_screenshot_ocr_multi_concatenated_floats(self):
+        """测试 3 个及以上连续无空格浮点数粘连的递归切分与对齐"""
+        mock_ocr_result = [
+            [[[10, 0], [50, 0], [50, 20], [10, 20]], "买一价", 0.99],  # cx=30
+            [[[60, 0], [100, 0], [100, 20], [60, 20]], "买二价", 0.99], # cx=80
+            [[[110, 0], [150, 0], [150, 20], [110, 20]], "买三价", 0.99], # cx=130
+
+            # 数据行：连续 3 个浮点数无空格粘连
+            [[[12, 30], [148, 30], [148, 50], [12, 50]], "10.5010.5510.60", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["买一价"], "10.50")
+            self.assertEqual(records[0]["买二价"], "10.55")
+            self.assertEqual(records[0]["买三价"], "10.60")
+
+    def test_screenshot_ocr_dense_grid_row_clustering_no_merge(self):
+        """测试同花顺 16-20px 紧凑行间距下，表头行与数据行绝不因垂直漂移而错误合并"""
+        mock_ocr_result = [
+            # 表头行 (y: 2~18, cy=10, h=16)
+            [[[10, 2], [60, 2], [60, 18], [10, 18]], "证券代码", 0.99],
+            [[[70, 2], [120, 2], [120, 18], [70, 18]], "证券名称", 0.99],
+            # 数据行紧贴表头下方 (y: 19~35, cy=27, h=16)，垂直不重叠
+            [[[10, 19], [60, 19], [60, 35], [10, 35]], "600519", 0.99],
+            [[[70, 21], [120, 21], [120, 37], [70, 37]], "贵州茅台", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["证券代码"], "600519")
+            self.assertEqual(records[0]["证券名称"], "贵州茅台")
+
+
+    def test_screenshot_ocr_outer_boundary_exclusion(self):
+        """测试位于表头物理列边界外侧的杂项（如最左侧行序号、最右侧滚动条文字）绝不污染表格字段"""
+        mock_ocr_result = [
+            # 表头：两列，从 x=60 到 x=200
+            [[[60, 0], [120, 0], [120, 20], [60, 20]], "证券代码", 0.99],   # cx=90
+            [[[130, 0], [200, 0], [200, 20], [130, 20]], "证券名称", 0.99],  # cx=165
+
+            # 数据行：x=10 处有行号 '1'，x=250 处有滚动条文字 '滚动'
+            [[[10, 30], [25, 30], [25, 50], [10, 50]], "1", 0.99],          # cx=17.5 位于表格左边界外
+            [[[60, 30], [120, 30], [120, 50], [60, 50]], "600519", 0.99],  # cx=90 证券代码
+            [[[130, 30], [200, 30], [200, 50], [130, 50]], "贵州茅台", 0.99],# cx=165 证券名称
+            [[[240, 30], [260, 30], [260, 50], [240, 50]], "滚动", 0.99],   # cx=250 位于表格右边界外
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["证券代码"], "600519")
+            self.assertEqual(records[0]["证券名称"], "贵州茅台")
+
+    def test_screenshot_ocr_header_whitespace_adhesion(self):
+        """测试表头中由于间距紧凑被 OCR 识别为同一个框的多列标题能被正确分解对齐"""
+        mock_ocr_result = [
+            # 表头行：买入价与卖出价粘连在一个框中
+            [[[10, 0], [100, 0], [100, 20], [10, 20]], "买入价 卖出价", 0.99],
+
+            # 数据行：两个正常独立的单元格
+            [[[10, 30], [50, 30], [50, 50], [10, 50]], "10.50", 0.99],
+            [[[60, 30], [100, 30], [100, 50], [60, 50]], "10.55", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertIn("买入价", records[0])
+            self.assertIn("卖出价", records[0])
+            self.assertEqual(records[0]["买入价"], "10.50")
+            self.assertEqual(records[0]["卖出价"], "10.55")
+
+    def test_screenshot_ocr_date_format_not_shredded(self):
+        """测试包含标准日期格式（如 2026.09.30）的单元格绝不被误判为浮点数粘连而拆碎"""
+        mock_ocr_result = [
+            # 表头：发生日期、证券代码
+            [[[0, 0], [50, 0], [50, 20], [0, 20]], "发生日期", 0.99],   # cx=25
+            [[[60, 0], [120, 0], [120, 20], [60, 20]], "证券代码", 0.99], # cx=90
+
+            # 数据行：发生日期为 2026.09.30，且靠右侧对齐 (x=20..70, cx=45)
+            [[[20, 30], [70, 30], [70, 50], [20, 50]], "2026.09.30", 0.99],
+            [[[80, 30], [120, 30], [120, 50], [80, 50]], "600519", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["发生日期"], "2026.09.30")
+            self.assertEqual(records[0]["证券代码"], "600519")
+
+    def test_cancel_entrust_missing_entrust_field_during_verify_raises_verification_error(self):
+        """测试撤单二次核对期间若表格缺少合同编号有效字段，严禁判定成功，必须触发 TradeVerificationError"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        # 二次核对时返回异常网格（缺少合同编号字段）
+        fake_entrusts_after_corrupted = [
+            {"证券代码": "000001", "买卖": "买入"},
+        ]
+
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok"}):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, fake_entrusts_after_corrupted],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                            self.assertIn("合同编号", str(ctx.exception))
+
+    def test_cancel_entrust_empty_grid_includes_pop_result(self):
+        """测试撤单二次核对网格为空时抛出的 TradeVerificationError 包含 pop_result"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        fake_entrusts_after = []
+
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok", "pop_key": "val"}):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, fake_entrusts_after],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                            self.assertEqual(ctx.exception.result.get("pop_result"), {"message": "ok", "pop_key": "val"})
+
+    def test_cancel_entrust_empty_or_whitespace_entrust_no_raises_value_error(self):
+        """测试当传入空或纯空白委托编号时立即抛出 ValueError 严禁误匹配空单元格"""
+        with self.assertRaises(ValueError):
+            self.trader.cancel_entrust("")
+        with self.assertRaises(ValueError):
+            self.trader.cancel_entrust("   ")
+        with self.assertRaises(ValueError):
+            self.trader.cancel_entrust(None)
+
+    def test_cancel_entrust_broker_pop_error_raises_verification_error(self):
+        """测试券商弹窗明确提示状态异常（如已全部成交不能撤单）时立即抛出 TradeVerificationError 严禁误判成功"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+            {"合同编号": "654321", "证券代码": "000002"},
+        ]
+        # 委托单已成交，因此二次核对时已从待撤列表中消失
+        fake_entrusts_after_executed = [
+            {"合同编号": "654321", "证券代码": "000002"},
+        ]
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(
+                        self.trader,
+                        "_handle_pop_dialogs",
+                        return_value={"message": "该委托已全部成交，不能撤单"},
+                    ):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, fake_entrusts_after_executed],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.5)
+                            self.assertIn("已全部成交", str(ctx.exception))
+                            self.assertEqual(ctx.exception.result.get("message"), "rejected")
+
+    def test_cancel_entrust_corrupted_non_dict_grid_elements(self):
+        """测试待撤列表中包含损坏的非 dict 元素时能够容错处理并触发无效网格异常"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        fake_entrusts_after_corrupted = [None, "invalid_row", 12345]
+
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok"}):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, fake_entrusts_after_corrupted],
+                        ):
+                            from easytrader.exceptions import TradeVerificationError
+                            with self.assertRaises(TradeVerificationError) as ctx:
+                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                            self.assertIn("合同编号", str(ctx.exception))
+
+    def test_copy_get_clipboard_failure_raises_ioerror(self):
+        """测试剪贴板读取连续失败 5 次时明确抛出 IOError 严禁静默返回空列表 []"""
+        strategy = Copy()
+        strategy.set_trader(self.trader)
+        Copy._need_captcha_reg = False
+
+        mock_grid = MagicMock()
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            with patch.object(strategy, "_set_foreground"):
+                with patch("pywinauto.clipboard.GetData", side_effect=Exception("Clipboard busy")):
+                    with self.assertRaises(IOError) as ctx:
+                        strategy.get(1047)
+                    self.assertIn("获取剪贴板数据失败", str(ctx.exception))
+
+    def test_screenshot_ocr_concatenated_floats_with_commas(self):
+        """测试包含千分位逗号的粘连浮点数（如 1,234.502,345.60）能够被正确分解与对齐"""
+        mock_ocr_result = [
+            # 表头两列：委托金额、成交金额
+            [[[10, 0], [100, 0], [100, 20], [10, 20]], "委托金额", 0.99],   # cx=55
+            [[[110, 0], [200, 0], [200, 20], [110, 20]], "成交金额", 0.99], # cx=155
+
+            # 数据行：粘连为 "1,234.502,345.60"
+            [[[10, 30], [200, 30], [200, 50], [10, 50]], "1,234.502,345.60", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["委托金额"], "1,234.50")
+            self.assertEqual(records[0]["成交金额"], "2,345.60")
+
+    def test_screenshot_ocr_arbitrary_polygon_box(self):
+        """测试多边形检测框（多于4个坐标点）时中心点计算稳定不错位"""
+        mock_ocr_result = [
+            # 表头：6点多边形
+            [[[10, 0], [30, 0], [50, 5], [50, 20], [30, 20], [10, 15]], "证券代码", 0.99],
+            [[[60, 0], [90, 0], [120, 5], [120, 20], [90, 20], [60, 15]], "证券名称", 0.99],
+
+            # 数据行：同样正常对齐
+            [[[10, 30], [30, 30], [50, 35], [50, 50], [30, 50], [10, 45]], "600519", 0.99],
+            [[[60, 30], [90, 30], [120, 35], [120, 50], [90, 50], [60, 45]], "贵州茅台", 0.99],
+        ]
+        mock_engine = MagicMock(return_value=(mock_ocr_result, 0.05))
+        strategy = grid_strategies.ScreenshotOCR(ocr_engine=mock_engine)
+
+        mock_image = MagicMock()
+        mock_grid = MagicMock()
+        mock_grid.capture_as_image.return_value = mock_image
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            records = strategy.get(1047)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["证券代码"], "600519")
+            self.assertEqual(records[0]["证券名称"], "贵州茅台")
+
+    def test_xls_get_cleans_up_temp_file(self):
+        """测试 Xls.get 提取完成后自动清理本地磁盘临时文件，杜绝文件句柄与磁盘空间泄漏"""
+        strategy = Xls()
+        strategy.set_trader(self.trader)
+
+        mock_grid = MagicMock()
+        mock_window = MagicMock()
+
+        created_files = []
+        original_mktemp = tempfile.mktemp
+
+        def fake_mktemp(*args, **kwargs):
+            path = original_mktemp(*args, **kwargs)
+            # 真实创建该文件模拟客户端保存
+            with open(path, "w", encoding="gbk") as f:
+                f.write("证券代码\t证券名称\n000001\t平安银行\n")
+            created_files.append(path)
+            return path
+
+        with patch.object(strategy, "_get_grid", return_value=mock_grid):
+            with patch.object(strategy, "_set_foreground"):
+                with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
+                    with patch("tempfile.mktemp", side_effect=fake_mktemp):
+                        with patch.object(self.trader.app, "top_window", return_value=mock_window):
+                            records = strategy.get(1047)
+                            self.assertEqual(len(records), 1)
+                            self.assertEqual(records[0]["证券代码"], "000001")
+                            self.assertEqual(len(created_files), 1)
+                            # 验证临时文件已被自动删除
+                            self.assertFalse(os.path.exists(created_files[0]))
+
 
 if __name__ == "__main__":
     unittest.main()
+

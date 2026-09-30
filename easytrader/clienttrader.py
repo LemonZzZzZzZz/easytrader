@@ -15,6 +15,7 @@ from pywinauto import findwindows, timings
 
 from easytrader import grid_strategies, pop_dialog_handler, refresh_strategies
 from easytrader.config import client
+from easytrader.exceptions import TradeError, TradeVerificationError
 from easytrader.grid_strategies import IGridStrategy
 from easytrader.log import logger
 from easytrader.refresh_strategies import IRefreshStrategy
@@ -187,10 +188,14 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def cancel_entrust(self, entrust_no, max_retries=2, verify_timeout=2.0):
+        if entrust_no is None or not str(entrust_no).strip():
+            raise ValueError("entrust_no 不能为空")
+
         self.refresh()
         target_idx = None
         for i, entrust in enumerate(self.cancel_entrusts):
-            if str(entrust.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")).strip() == str(entrust_no).strip():
+            val = str(entrust.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")).strip() if isinstance(entrust, dict) else ""
+            if val == str(entrust_no).strip():
                 target_idx = i
                 break
 
@@ -223,20 +228,71 @@ class ClientTrader(IClientTrader):
 
         pop_res = self._handle_pop_dialogs()
 
+        # 如果弹窗明确提示撤单失败或状态异常（如已成交、废单、不可撤单等），严禁误判为成功，必须立即抛出 TradeVerificationError
+        pop_msg = str(pop_res.get("message", "")).strip() if isinstance(pop_res, dict) else ""
+        error_keywords = ("失败", "不能", "无法", "不可", "错误", "已成交", "已成", "废单", "已撤", "不存在", "异常", "拒绝")
+        if any(kw in pop_msg for kw in error_keywords):
+            raise TradeVerificationError(
+                f"委托单 {entrust_no} 撤单状态异常: {pop_msg}",
+                result={"message": "rejected", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+            )
+
         # 异步状态二次核对：短轮询确认目标单是否已从待撤列表中消失
         if verify_timeout > 0:
             start_t = time.time()
+            last_grid_error = None
             while time.time() - start_t < verify_timeout:
                 self.refresh()
+                try:
+                    curr_entrusts = self.cancel_entrusts
+                except Exception as e:
+                    last_grid_error = e
+                    logger.warning("获取待撤列表异常: %s", e)
+                    self.wait(0.3)
+                    continue
+
+                if not curr_entrusts:
+                    # 严禁将空网格误判为订单已被撤销
+                    last_grid_error = TradeVerificationError(
+                        f"待撤列表为空，无法确认委托单 {entrust_no} 是否已被成功撤销",
+                        result={"message": "empty_grid", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+                    )
+                    self.wait(0.3)
+                    continue
+
+                # 显式断言表格获取有效（非空且包含有效合同编号），严禁将缺少字段的异常网格误判为撤单成功
+                entrust_field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
                 remaining = [
-                    str(e.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")).strip()
-                    for e in self.cancel_entrusts
+                    str(e.get(entrust_field, "")).strip()
+                    for e in curr_entrusts
+                    if isinstance(e, dict)
                 ]
+                if not any(bool(r) for r in remaining):
+                    last_grid_error = TradeVerificationError(
+                        f"待撤列表未包含有效 {entrust_field} 数据，无法确认委托单 {entrust_no} 是否已被成功撤销",
+                        result={"message": "invalid_grid", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+                    )
+                    self.wait(0.3)
+                    continue
+
+                # 表格获取有效后，清除历史瞬态异常并核对委托单是否已消失
+                last_grid_error = None
                 if str(entrust_no).strip() not in remaining:
                     return {"message": "success", "entrust_no": str(entrust_no), "verified": True}
                 self.wait(0.3)
+
             logger.warning("委托单 %s 撤单后未能在 %ss 内确认从待撤列表中移除", entrust_no, verify_timeout)
-            return {"message": "unconfirmed", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+            if last_grid_error:
+                if isinstance(last_grid_error, TradeVerificationError):
+                    raise last_grid_error
+                raise TradeVerificationError(
+                    f"委托单 {entrust_no} 撤单验证失败，网格数据异常: {last_grid_error}",
+                    result={"message": "unconfirmed", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+                ) from last_grid_error
+            raise TradeVerificationError(
+                f"委托单 {entrust_no} 撤单后未能在 {verify_timeout}s 内确认从待撤列表中移除",
+                result={"message": "unconfirmed", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+            )
 
         return pop_res
 

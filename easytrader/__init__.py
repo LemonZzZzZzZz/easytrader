@@ -3,6 +3,7 @@ import urllib3
 
 from easytrader import exceptions
 from easytrader.api import use, follower
+from easytrader.exceptions import TradeError, TradeVerificationError
 from easytrader.log import logger
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
