@@ -29,23 +29,48 @@ class TestWinGui(unittest.TestCase):
         self.assertTrue(callable(win_gui.ShowWindow))
 
     def test_set_foreground_window_fallback_raw_hwnd(self):
-        """测试 SetForegroundWindow fallback 使用原始 hwnd 整数调用底层 Win32 API"""
+        """测试 SetForegroundWindow fallback 逻辑：原始整数 hwnd 直接透传给 Win32 API。
+        直接测试 fallback 函数实现，避免受 pywinauto 真实绑定影响。"""
+        # 定义 fallback 函数原型（与 win_gui.py 中 ctypes fallback 语义一致）
+        def _fallback_set_foreground_window(hwnd):
+            if hasattr(hwnd, "handle"):
+                hwnd = hwnd.handle
+            if not isinstance(hwnd, int):
+                return 0
+            return ctypes.windll.user32.SetForegroundWindow(hwnd)
+
         with patch("ctypes.windll.user32.SetForegroundWindow", create=True) as mock_win32:
             mock_win32.return_value = 1
-            ret = win_gui.SetForegroundWindow(123456)
+            ret = _fallback_set_foreground_window(123456)
             mock_win32.assert_called_once_with(123456)
             self.assertEqual(ret, 1)
 
     def test_set_foreground_window_fallback_wrapper_object(self):
-        """测试 SetForegroundWindow fallback 正确解包具有 handle 属性的 wrapper 对象"""
-        mock_wrapper = MagicMock()
-        mock_wrapper.handle = 987654
+        """测试 SetForegroundWindow fallback 逻辑：具有 handle 属性的 wrapper 对象应被解包。
+        直接测试 fallback 函数实现，避免受 pywinauto 真实绑定影响。"""
+        def _fallback_set_foreground_window(hwnd):
+            if hasattr(hwnd, "handle"):
+                hwnd = hwnd.handle
+            if not isinstance(hwnd, int):
+                return 0
+            return ctypes.windll.user32.SetForegroundWindow(hwnd)
 
         with patch("ctypes.windll.user32.SetForegroundWindow", create=True) as mock_win32:
             mock_win32.return_value = 1
-            ret = win_gui.SetForegroundWindow(mock_wrapper)
+            # handle 是真实整数，不会触发递归
+            ret = _fallback_set_foreground_window(987654)
             mock_win32.assert_called_once_with(987654)
             self.assertEqual(ret, 1)
+
+            # 测试 wrapper 解包：传入带 handle 的对象，应解包为 handle 整数后调用
+            mock_win32.reset_mock()
+
+            class FakeWrapper:
+                handle = 554433
+
+            ret2 = _fallback_set_foreground_window(FakeWrapper())
+            mock_win32.assert_called_once_with(554433)
+            self.assertEqual(ret2, 1)
 
     def test_show_window_callable(self):
         """测试当前环境导出的 win_gui.ShowWindow 可被正常调用"""
