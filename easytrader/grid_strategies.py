@@ -67,6 +67,32 @@ class BaseStrategy(IGridStrategy):
         except:
             pass
 
+    @staticmethod
+    def _filter_summary_rows(records: List[Dict]) -> List[Dict]:
+        """
+        过滤表格底部的「汇总/合计/总计/小计」统计行
+        """
+        if not records:
+            return records
+        cleaned = []
+        summary_keywords = ("汇总", "合计", "总计", "小计")
+        for row in records:
+            if not isinstance(row, dict):
+                continue
+            row_text = "".join(str(v) for v in row.values() if v is not None)
+            if any(kw in row_text for kw in summary_keywords):
+                raw_code = row.get("证券代码")
+                code = str(raw_code).strip() if raw_code is not None else ""
+                raw_name = row.get("证券名称")
+                name = str(raw_name).strip() if raw_name is not None else ""
+                if any(kw in code for kw in summary_keywords) or \
+                   any(kw in name for kw in summary_keywords) or \
+                   not code or not code.isdigit():
+                    logger.info("过滤表格统计汇总行: %s", row)
+                    continue
+            cleaned.append(row)
+        return cleaned
+
 
 class Copy(BaseStrategy):
     """
@@ -84,15 +110,18 @@ class Copy(BaseStrategy):
 
     def _format_grid_data(self, data: str) -> List[Dict]:
         try:
+            if not data or not data.strip():
+                return []
             df = pd.read_csv(
                 io.StringIO(data),
                 delimiter="\t",
                 dtype=self._trader.config.GRID_DTYPE,
                 na_filter=False,
             )
-            return df.to_dict("records")
-        except:
+            return self._filter_summary_rows(df.to_dict("records"))
+        except Exception:
             Copy._need_captcha_reg = True
+            return []
 
     def _get_clipboard_data(self) -> str:
         if Copy._need_captcha_reg:
@@ -204,13 +233,112 @@ class Xls(BaseStrategy):
         return self._format_grid_data(temp_path)
 
     def _format_grid_data(self, data: str) -> List[Dict]:
-        with open(data, encoding="gbk", errors="replace") as f:
-            content = f.read()
+        try:
+            with open(data, encoding="gbk", errors="replace") as f:
+                content = f.read()
 
-        df = pd.read_csv(
-            StringIO(content),
-            delimiter="\t",
-            dtype=self._trader.config.GRID_DTYPE,
-            na_filter=False,
-        )
-        return df.to_dict("records")
+            if not content or not content.strip():
+                return []
+
+            df = pd.read_csv(
+                StringIO(content),
+                delimiter="\t",
+                dtype=self._trader.config.GRID_DTYPE,
+                na_filter=False,
+            )
+            return self._filter_summary_rows(df.to_dict("records"))
+        except Exception as e:
+            logger.warning("解析表格文件失败: %s", e)
+            return []
+
+
+class ScreenshotOCR(BaseStrategy):
+    """
+    通过后台截取 Grid 控件图像 + OCR 识别提取表格数据
+    完全不操作系统剪贴板，彻底杜绝剪贴板并发竞争与柜台验证码
+    """
+
+    def __init__(self, ocr_engine=None):
+        super().__init__()
+        self._ocr_engine = ocr_engine
+
+    def _get_ocr_engine(self):
+        if self._ocr_engine is not None:
+            return self._ocr_engine
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+
+            self._ocr_engine = RapidOCR()
+            return self._ocr_engine
+        except ImportError:
+            raise ImportError(
+                "使用 ScreenshotOCR 策略需要安装 rapidocr_onnxruntime 依赖。\n"
+                "请运行: pip install rapidocr_onnxruntime"
+            )
+
+    def get(self, control_id: int) -> List[Dict]:
+        grid = self._get_grid(control_id)
+        # capture_as_image 直接在 Win32 句柄层面截屏，无需置顶或争抢剪贴板
+        img = grid.capture_as_image()
+        records = self._parse_image_records(img)
+        return self._filter_summary_rows(records)
+
+    def _parse_image_records(self, img) -> List[Dict]:
+        """
+        利用 OCR 结果根据空间几何坐标重组表格行列
+        """
+        engine = self._get_ocr_engine()
+        import numpy as np
+
+        img_np = np.array(img)
+        result, _ = engine(img_np)
+        if not result:
+            return []
+
+        items = []
+        for box, text, score in result:
+            text = str(text).strip()
+            if not text:
+                continue
+            cy = sum(p[1] for p in box) / 4.0
+            cx = sum(p[0] for p in box) / 4.0
+            h = abs(box[2][1] - box[0][1])
+            items.append({"text": text, "cx": cx, "cy": cy, "h": h, "box": box})
+
+        if not items:
+            return []
+
+        avg_h = sum(it["h"] for it in items) / len(items) if items else 16.0
+        line_threshold = max(avg_h * 0.6, 8.0)
+
+        items_sorted_y = sorted(items, key=lambda x: x["cy"])
+        rows = []
+        current_row = [items_sorted_y[0]]
+        current_cy = items_sorted_y[0]["cy"]
+
+        for it in items_sorted_y[1:]:
+            if abs(it["cy"] - current_cy) < line_threshold:
+                current_row.append(it)
+            else:
+                rows.append(sorted(current_row, key=lambda x: x["cx"]))
+                current_row = [it]
+                current_cy = it["cy"]
+        if current_row:
+            rows.append(sorted(current_row, key=lambda x: x["cx"]))
+
+        if len(rows) < 2:
+            return []
+
+        headers = [it["text"] for it in rows[0]]
+        data_records = []
+        for r in rows[1:]:
+            record = {}
+            for col_idx, cell in enumerate(r):
+                if col_idx < len(headers):
+                    record[headers[col_idx]] = cell["text"]
+                else:
+                    record[f"col_{col_idx}"] = cell["text"]
+            if record:
+                data_records.append(record)
+
+        return data_records

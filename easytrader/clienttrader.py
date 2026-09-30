@@ -20,6 +20,7 @@ from easytrader.log import logger
 from easytrader.refresh_strategies import IRefreshStrategy
 from easytrader.utils.misc import file2dict
 from easytrader.utils.perf import perf_clock
+from easytrader.utils.win_gui import get_window_dpi_scale
 
 if not sys.platform.startswith("darwin"):
     import pywinauto
@@ -60,7 +61,7 @@ class IClientTrader(abc.ABC):
 
 
 class ClientTrader(IClientTrader):
-    _editor_need_type_keys = False
+    _editor_need_type_keys = True
     # The strategy to use for getting grid data
     grid_strategy: Union[IGridStrategy, Type[IGridStrategy]] = grid_strategies.Copy
     _grid_strategy_instance: IGridStrategy = None
@@ -115,7 +116,16 @@ class ClientTrader(IClientTrader):
 
         self._app = pywinauto.Application().connect(path=connect_path, timeout=10)
         self._close_prompt_windows()
-        self._main = self._app.top_window()
+        # 优先通过配置的 TITLE 或默认标题匹配主窗口，若未匹配到再回退至 top_window
+        title_target = getattr(self._config, "TITLE", "网上股票交易系统5.0")
+        try:
+            main_window = self._app.window(title_re=f".*{title_target}.*")
+            if main_window.exists(timeout=1):
+                self._main = main_window
+            else:
+                self._main = self._app.top_window()
+        except Exception:
+            self._main = self._app.top_window()
         self._init_toolbar()
 
     @property
@@ -134,11 +144,20 @@ class ClientTrader(IClientTrader):
     def _get_balance_from_statics(self):
         result = {}
         for key, control_id in self._config.BALANCE_CONTROL_ID_GROUP.items():
-            result[key] = float(
-                self._main.child_window(
-                    control_id=control_id, class_name="Static"
-                ).window_text()
-            )
+            try:
+                val_text = (
+                    self._main.child_window(
+                        control_id=control_id, class_name="Static"
+                    )
+                    .window_text()
+                    .strip()
+                    .replace(",", "")
+                )
+                result[key] = float(val_text)
+            except Exception as e:
+                logger.warning(
+                    "获取资金静态控件 %s (ID: %s) 失败: %s", key, control_id, e
+                )
         return result
 
     @property
@@ -167,35 +186,99 @@ class ClientTrader(IClientTrader):
         return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
 
     @perf_clock
-    def cancel_entrust(self, entrust_no):
+    def cancel_entrust(self, entrust_no, max_retries=2, verify_timeout=2.0):
         self.refresh()
+        target_idx = None
         for i, entrust in enumerate(self.cancel_entrusts):
-            if entrust[self._config.CANCEL_ENTRUST_ENTRUST_FIELD] == entrust_no:
-                self._cancel_entrust_by_double_click(i)
-                return self._handle_pop_dialogs()
-        return {"message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"}
+            if str(entrust.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")).strip() == str(entrust_no).strip():
+                target_idx = i
+                break
 
-    def cancel_all_entrusts(self):
+        if target_idx is None:
+            return {"message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"}
+
+        self._cancel_entrust_by_double_click(target_idx)
+
+        # 点击确认弹窗，并增加重试机制避免首次点击未响应
+        retry = 0
+        while retry <= max_retries:
+            if self.is_exist_pop_dialog():
+                w = self._app.top_window()
+                clicked = False
+                for btn_title in ["是(Y)", "确定", "是(&Y)", "是"]:
+                    try:
+                        btn = w[btn_title]
+                        if btn.exists():
+                            btn.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
+                self.wait(0.2)
+                if clicked and not self.is_exist_pop_dialog():
+                    break
+            else:
+                break
+            retry += 1
+
+        pop_res = self._handle_pop_dialogs()
+
+        # 异步状态二次核对：短轮询确认目标单是否已从待撤列表中消失
+        if verify_timeout > 0:
+            start_t = time.time()
+            while time.time() - start_t < verify_timeout:
+                self.refresh()
+                remaining = [
+                    str(e.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")).strip()
+                    for e in self.cancel_entrusts
+                ]
+                if str(entrust_no).strip() not in remaining:
+                    return {"message": "success", "entrust_no": str(entrust_no), "verified": True}
+                self.wait(0.3)
+            logger.warning("委托单 %s 撤单后未能在 %ss 内确认从待撤列表中移除", entrust_no, verify_timeout)
+            return {"message": "unconfirmed", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+
+        return pop_res
+
+    def cancel_all_entrusts(self, max_retries=2):
         self.refresh()
         self._switch_left_menus(["撤单[F3]"])
 
         # 点击全部撤销控件
-        self._app.top_window().child_window(
-            control_id=self._config.TRADE_CANCEL_ALL_ENTRUST_CONTROL_ID, class_name="Button", title_re="""全撤.*"""
-        ).click()
+        try:
+            btn_cancel_all = self._app.top_window().child_window(
+                control_id=self._config.TRADE_CANCEL_ALL_ENTRUST_CONTROL_ID,
+                class_name="Button",
+                title_re="""全撤.*""",
+            )
+            if btn_cancel_all.exists(timeout=1):
+                btn_cancel_all.click()
+        except Exception as e:
+            logger.warning("点击全撤按钮异常: %s", e)
         self.wait(0.2)
 
-        # 等待出现 确认兑换框
-        if self.is_exist_pop_dialog():
-            # 点击是 按钮
-            w = self._app.top_window()
-            if w is not None:
-                btn = w["是(Y)"]
-                if btn is not None:
-                    btn.click()
-                    self.wait(0.2)
+        # 等待出现确认对话框并重试点击
+        retry = 0
+        while retry <= max_retries:
+            if self.is_exist_pop_dialog():
+                w = self._app.top_window()
+                clicked = False
+                for btn_name in ["是(Y)", "确定", "是(&Y)", "是"]:
+                    try:
+                        btn = w[btn_name]
+                        if btn.exists():
+                            btn.click()
+                            clicked = True
+                            break
+                    except Exception:
+                        pass
+                self.wait(0.2)
+                if clicked and not self.is_exist_pop_dialog():
+                    break
+            else:
+                break
+            retry += 1
 
-        # 如果出现了确认窗口
         self.close_pop_dialog()
 
     @perf_clock
@@ -346,11 +429,24 @@ class ClientTrader(IClientTrader):
 
         return self._handle_pop_dialogs()
 
+    def get_dpi_scale_factor(self) -> float:
+        """获取交易主窗口的 DPI 缩放比例因子，默认 1.0"""
+        try:
+            if self._main is not None:
+                return get_window_dpi_scale(self._main.handle)
+        except Exception:
+            pass
+        return get_window_dpi_scale(None)
+
     def _click_grid_by_row(self, row):
-        x = self._config.COMMON_GRID_LEFT_MARGIN
-        y = (
-            self._config.COMMON_GRID_FIRST_ROW_HEIGHT
-            + self._config.COMMON_GRID_ROW_HEIGHT * row
+        scale = self.get_dpi_scale_factor()
+        x = int(self._config.COMMON_GRID_LEFT_MARGIN * scale)
+        y = int(
+            (
+                self._config.COMMON_GRID_FIRST_ROW_HEIGHT
+                + self._config.COMMON_GRID_ROW_HEIGHT * (row + 0.5)
+            )
+            * scale
         )
         self._app.top_window().child_window(
             control_id=self._config.COMMON_GRID_CONTROL_ID,
@@ -398,17 +494,20 @@ class ClientTrader(IClientTrader):
 
     def _close_prompt_windows(self):
         self.wait(1)
+        title_target = getattr(self._config, "TITLE", "网上股票交易系统5.0")
         for window in self._app.windows(class_name="#32770", visible_only=True):
             title = window.window_text()
-            if title != self._config.TITLE:
+            if title != self._config.TITLE and title_target not in title:
                 logging.info("close window %s" % title)
                 window.close()
                 self.wait(0.2)
         self.wait(1)
 
     def close_pormpt_window_no_wait(self):
+        title_target = getattr(self._config, "TITLE", "网上股票交易系统5.0")
         for window in self._app.windows(class_name="#32770"):
-            if window.window_text() != self._config.TITLE:
+            title = window.window_text()
+            if title != self._config.TITLE and title_target not in title:
                 window.close()
 
     def trade(self, security, price, amount):
@@ -475,16 +574,10 @@ class ClientTrader(IClientTrader):
             self._config.TRADE_AMOUNT_CONTROL_ID, str(int(amount))
         )
         self.wait(0.1)
-        price_control = None
-        if str(security).startswith("68"):  # 科创板存在限价
-            try:
-                price_control = self._main.child_window(
-                    control_id=self._config.TRADE_PRICE_CONTROL_ID, class_name="Edit"
-                )
-            except:
-                pass
-        if price_control is not None:
-            price_control.set_edit_text(limit_price)
+        if str(security).startswith("68") and limit_price is not None:
+            self._type_edit_control_keys(
+                self._config.TRADE_PRICE_CONTROL_ID, str(limit_price)
+            )
 
     def _get_grid_data(self, control_id):
         return self.grid_strategy_instance.get(control_id)
@@ -547,10 +640,14 @@ class ClientTrader(IClientTrader):
             count = count - 1
 
     def _cancel_entrust_by_double_click(self, row):
-        x = self._config.CANCEL_ENTRUST_GRID_LEFT_MARGIN
-        y = (
-            self._config.CANCEL_ENTRUST_GRID_FIRST_ROW_HEIGHT
-            + self._config.CANCEL_ENTRUST_GRID_ROW_HEIGHT * row
+        scale = self.get_dpi_scale_factor()
+        x = int(self._config.CANCEL_ENTRUST_GRID_LEFT_MARGIN * scale)
+        y = int(
+            (
+                self._config.CANCEL_ENTRUST_GRID_FIRST_ROW_HEIGHT
+                + self._config.CANCEL_ENTRUST_GRID_ROW_HEIGHT * (row + 0.5)
+            )
+            * scale
         )
         self._app.top_window().child_window(
             control_id=self._config.COMMON_GRID_CONTROL_ID,

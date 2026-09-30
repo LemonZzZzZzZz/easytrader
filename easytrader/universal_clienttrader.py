@@ -23,8 +23,6 @@ class UniversalClientTrader(clienttrader.BaseLoginClientTrader):
         :param kwargs:
         :return:
         """
-        self._editor_need_type_keys = False
-
         try:
             self._app = pywinauto.Application().connect(
                 path=self._run_exe_path(exe_path), timeout=1

@@ -18,7 +18,6 @@ class WKClientTrader(HTClientTrader):
                 :param kwargs:
                 :return:
                 """
-        self._editor_need_type_keys = False
         if comm_password is None:
             raise ValueError("五矿必须设置通讯密码")
 

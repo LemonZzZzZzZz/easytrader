@@ -23,7 +23,6 @@ class HTClientTrader(clienttrader.BaseLoginClientTrader):
         :param kwargs:
         :return:
         """
-        self._editor_need_type_keys = False
         if comm_password is None:
             raise ValueError("华泰必须设置通讯密码")
 
@@ -54,23 +53,8 @@ class HTClientTrader(clienttrader.BaseLoginClientTrader):
                 path=self._run_exe_path(exe_path), timeout=10
             )
         self._main = self._app.window(title="网上股票交易系统5.0")
-        self._main.wait ( "exists enabled visible ready" , timeout=100 )
-        self._close_prompt_windows ( )
+        self._main.wait("exists enabled visible ready", timeout=100)
+        self._close_prompt_windows()
 
-    @property
-    def balance(self):
-        self._switch_left_menus(self._config.BALANCE_MENU_PATH)
-
-        return self._get_balance_from_statics()
-
-    def _get_balance_from_statics(self):
-        result = {}
-        for key, control_id in self._config.BALANCE_CONTROL_ID_GROUP.items():
-            result[key] = float(
-                self._main.child_window(
-                    control_id=control_id, class_name="Static"
-                ).window_text()
-            )
-        return result
 
 
