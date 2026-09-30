@@ -6,7 +6,7 @@ import os
 import re
 import sys
 import time
-from typing import Type, Union
+from typing import Callable, Dict, List, Optional, Type, Union
 
 import hashlib, binascii
 
@@ -61,12 +61,43 @@ class IClientTrader(abc.ABC):
         pass
 
 
+class _GridStrategyDescriptor(property):
+    def __init__(self):
+        super().__init__(self._fget, self._fset)
+
+    def _fget(self, instance):
+        if instance is None:
+            return grid_strategies.Copy
+        if getattr(instance, "_grid_strategy", None) is not None:
+            return instance._grid_strategy
+        return getattr(instance, "_default_grid_strategy", grid_strategies.Copy)
+
+    def _fset(self, instance, value):
+        instance._grid_strategy = value
+        instance._grid_strategy_instance = None
+        if isinstance(value, IGridStrategy):
+            instance._grid_strategy_instance = value
+            instance._grid_strategy_instance.set_trader(instance)
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return getattr(owner, "_default_grid_strategy", grid_strategies.Copy)
+        return self._fget(instance)
+
+
 class ClientTrader(IClientTrader):
     _editor_need_type_keys = True
+    _default_grid_strategy: Union[IGridStrategy, Type[IGridStrategy]] = grid_strategies.Copy
     # The strategy to use for getting grid data
-    grid_strategy: Union[IGridStrategy, Type[IGridStrategy]] = grid_strategies.Copy
-    _grid_strategy_instance: IGridStrategy = None
+    grid_strategy = _GridStrategyDescriptor()
+    _grid_strategy_instance: Optional[IGridStrategy] = None
     refresh_strategy: IRefreshStrategy = refresh_strategies.Switch()
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        if "grid_strategy" in cls.__dict__ and not isinstance(cls.__dict__["grid_strategy"], property):
+            cls._default_grid_strategy = cls.__dict__["grid_strategy"]
+            delattr(cls, "grid_strategy")
 
     def enable_type_keys_for_editor(self):
         """
@@ -77,19 +108,72 @@ class ClientTrader(IClientTrader):
     @property
     def grid_strategy_instance(self):
         if self._grid_strategy_instance is None:
+            strat = self.grid_strategy
             self._grid_strategy_instance = (
-                self.grid_strategy
-                if isinstance(self.grid_strategy, IGridStrategy)
-                else self.grid_strategy()
+                strat
+                if isinstance(strat, IGridStrategy)
+                else strat()
             )
             self._grid_strategy_instance.set_trader(self)
         return self._grid_strategy_instance
+
+    def enable_vlm_fallback(
+        self,
+        model: str = "qwen2.5-vl:7b",
+        host: str = "http://localhost:11434",
+        primary_strategy=None,
+        circuit_breaker: bool = True,
+        on_fallback: Optional[Callable[[Dict], None]] = None,
+        **kwargs,
+    ):
+        """
+        启用多级视觉降级通道 (Primary -> ScreenshotOCR -> OllamaVLM)
+
+        :param model: Ollama 模型名称，默认 "qwen2.5-vl:7b"
+        :param host: Ollama HTTP 服务地址，默认 "http://localhost:11434"
+        :param primary_strategy: 首选网格策略，若为 None 则使用当前 grid_strategy_instance
+        :param circuit_breaker: 是否启用熔断器，默认 True
+        :param on_fallback: 触发降级时的回调函数 callback(fallback_info)
+        :param kwargs: 传递给 FallbackChain 的其他可选参数 (如 failure_threshold, recovery_timeout, artifact_dir, validator 等)
+        :return: FallbackChain 实例
+        """
+        if primary_strategy is None:
+            curr = self.grid_strategy_instance
+            if isinstance(curr, grid_strategies.FallbackChain) and curr.strategies:
+                primary = curr.strategies[0]
+            else:
+                primary = curr
+        elif isinstance(primary_strategy, type):
+            primary = primary_strategy()
+        else:
+            primary = primary_strategy
+
+        ocr_strat = grid_strategies.ScreenshotOCR()
+        vlm_strat = grid_strategies.OllamaVLM(model=model, host=host)
+
+        # 构建策略阶梯: [primary, ScreenshotOCR, OllamaVLM]
+        strategies = [primary]
+        if not any(isinstance(s, grid_strategies.ScreenshotOCR) for s in strategies):
+            strategies.append(ocr_strat)
+        if not any(isinstance(s, grid_strategies.OllamaVLM) for s in strategies):
+            strategies.append(vlm_strat)
+
+        chain = grid_strategies.FallbackChain(
+            strategies=strategies,
+            circuit_breaker=circuit_breaker,
+            on_fallback=on_fallback,
+            **kwargs,
+        )
+        self.grid_strategy = chain
+        return chain
 
     def __init__(self):
         self._config = client.create(self.broker_type)
         self._app = None
         self._main = None
         self._toolbar = None
+        self._grid_strategy = None
+        self._grid_strategy_instance = None
 
     @property
     def app(self):
