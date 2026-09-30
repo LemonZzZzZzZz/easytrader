@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 
 from easytrader import clienttrader, exceptions
 from easytrader.clienttrader import ClientTrader
@@ -1215,15 +1215,29 @@ class TestVLMBackendsAndEdgeCases(unittest.TestCase):
                     mock_click.assert_called_once_with((80, 220), window=trader._main)
 
     def test_frosted_white_mask_detection(self):
-        """测试准确检测高亮磨砂全屏遮罩锁死 (mean >= 215, std < 12)"""
+        """测试准确检测高亮磨砂全屏遮罩锁死 (mean >= 215, 0.5 <= std < 12, edge_variance < 5)"""
         watchdog = ClientVisualLivenessWatchdog()
-        # 纯浅灰白磨砂蒙层 (rgb 230, 230, 230)
-        white_mask = Image.new("RGB", (400, 300), color=(230, 230, 230))
+        # 构造真实的磨砂半透明高亮蒙层图像（底层有窗口轮廓但被磨砂高斯模糊严重抹平）
+        base = Image.new("RGB", (400, 300), color=(240, 240, 240))
+        d = ImageDraw.Draw(base)
+        d.rectangle([(50, 50), (350, 250)], fill=(220, 220, 220))
+        white_mask = base.filter(ImageFilter.GaussianBlur(radius=6))
         report = watchdog.inspect(white_mask)
         self.assertFalse(report.is_alive)
         self.assertEqual(report.state, "MASK_LOCKED")
         self.assertEqual(report.recovery_action, "DISMISS_MASK")
         self.assertTrue(any("遮罩锁死" in issue for issue in report.issues))
+
+    def test_pure_white_empty_grid_not_misdiagnosed_as_mask_locked(self):
+        """回归测试：纯白单色未渲染空表 (mean=255, std=0, edge_var=0) 严禁被误判为 MASK_LOCKED"""
+        watchdog = ClientVisualLivenessWatchdog()
+        pure_white = Image.new("RGB", (400, 300), color=(255, 255, 255))
+        report = watchdog.inspect(pure_white)
+        self.assertFalse(report.is_alive)
+        self.assertEqual(report.state, "BLANK_SCREEN")
+        self.assertEqual(report.recovery_action, "RETRY_CAPTURE")
+        self.assertNotEqual(report.state, "MASK_LOCKED")
+        self.assertTrue(any("单色纯白或未渲染" in issue for issue in report.issues))
 
     def test_extended_rejection_keywords(self):
         """测试捕获券商常见拒绝词汇：无可用资金与已停牌"""

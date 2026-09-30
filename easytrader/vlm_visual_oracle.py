@@ -1219,6 +1219,19 @@ class ClientVisualLivenessWatchdog:
         details["mean_brightness"] = mean_brightness
         details["std_brightness"] = std_brightness
 
+        # 计算图像梯度与边缘方差，用于联合甄别：真实正常界面、半透明磨砂遮罩与完全单色空白
+        gray_arr = (
+            np.mean(img_arr, axis=2).astype(np.float32)
+            if len(img_arr.shape) == 3
+            else img_arr.astype(np.float32)
+        )
+        gy, gx = np.gradient(gray_arr)
+        grad_mag = np.hypot(gx, gy)
+        edge_variance = float(np.var(grad_mag))
+        edge_mean = float(np.mean(grad_mag))
+        details["edge_variance"] = edge_variance
+        details["edge_mean"] = edge_mean
+
         if mean_brightness < 8.0 and std_brightness < 5.0:
             issues.append("远程桌面断开或锁屏黑屏 (均值与方差接近0)")
             return LivenessReport(
@@ -1227,6 +1240,19 @@ class ClientVisualLivenessWatchdog:
                 issues=issues,
                 details=details,
                 recovery_action="RECONNECT",
+            )
+
+        # 2.1 检查单色纯白未渲染或无内容空白截屏 (如空持仓页白底、窗口尚未完成绘制)
+        # 特征：标准差与边缘方差近零 (std < 0.5 且 edge_variance < 0.5)
+        # 严禁将纯白/单色未渲染空表误报为全屏磨砂遮罩锁死 (MASK_LOCKED)
+        if mean_brightness >= 200.0 and std_brightness < 0.5 and edge_variance < 0.5:
+            issues.append("检测到单色纯白或未渲染完成界面 (std < 0.5, 无边缘特征)")
+            return LivenessReport(
+                is_alive=False,
+                state="BLANK_SCREEN",
+                issues=issues,
+                details=details,
+                recovery_action="RETRY_CAPTURE",
             )
 
         # 3. 检查通讯指示灯红灯脱机
@@ -1282,9 +1308,17 @@ class ClientVisualLivenessWatchdog:
             )
 
         # 4. 检查全屏遮罩锁死 (半透明全屏蒙层 DirectUI 遮罩)
-        # 遮罩特征：对比度急剧降低，整体变暗或磨砂高亮泛白，且全屏方差极小
-        is_dark_mask = 8.0 <= mean_brightness <= 50.0 and std_brightness < 18.0
-        is_frosted_white_mask = mean_brightness >= 215.0 and std_brightness < 12.0
+        # 遮罩特征：对比度急剧降低，整体变暗或磨砂高亮泛白，且全屏高频边缘几乎被完全抹平
+        # 联合判定机制：
+        # - 下界防线：std_brightness >= 0.5 (排除纯白空白)
+        # - 上界防线：std_brightness < 12.0 (磨砂模糊后的残余灰度波动)
+        # - 边缘防线：edge_variance < 5.0 (排除具有锐利文字或网格线的正常稀疏白底表格界面)
+        is_dark_mask = 8.0 <= mean_brightness <= 50.0 and std_brightness < 18.0 and edge_variance < 8.0
+        is_frosted_white_mask = (
+            mean_brightness >= 215.0
+            and 0.5 <= std_brightness < 12.0
+            and edge_variance < 5.0
+        )
         if is_dark_mask or is_frosted_white_mask:
             mask_type = "暗色蒙层" if is_dark_mask else "高亮磨砂蒙层"
             issues.append(f"界面全屏遮罩锁死 (全局{mask_type}低对比度卡死)")
