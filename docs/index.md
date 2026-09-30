@@ -1,10 +1,45 @@
 # 简介
 
-* 通用的同花顺客户端模拟操作
+* 通用的同花顺客户端模拟操作与实操加固
+* **[新特性]** 基于视觉大模型（VLM）的多模态交易安全卫士与自适应降级体系
 * 支持券商的 [miniqmt](miniqmt.md) 官方量化接口
 * 支持雪球组合调仓和跟踪
 * 支持远程操作客户端
 * 支持跟踪 `joinquant`, `ricequant` 的模拟交易
+
+---
+
+## 🔥 同花顺客户端实操加固与视觉安全卫士
+
+针对同花顺自绘老旧架构（`CVirtualGridCtrl`）在实盘中常见的**假下单、空表假撤单、高分屏截断、无弹窗静默废单、高并发重复挂单及阻断弹窗卡死**等顽疾，本项目深度加固了底层通信与容错契约，并引入了基于多模态大模型的视觉安全卫士系统。
+
+### 核心功能与使用示例
+
+```python
+import easytrader
+
+user = easytrader.use('universal_client')
+user.prepare('ths.json')
+
+# 1. 一键启用网格数据三级视觉降级通道 (Copy -> OCR -> VLM)
+user.enable_vlm_fallback(model="qwen3.6:35b", host="http://localhost:11434")
+
+# 2. 一键启用交易全流程视觉安全卫士 (废单捕获、弹窗倒计时决策、双帧差分防重买)
+user.enable_vlm_visual_oracle(
+    model="qwen3.6:35b",
+    host="http://localhost:11434",
+    enable_status_bar_verification=True,
+    enable_dialog_arbitration=True,
+    enable_dual_frame_trade_arbitration=True,
+)
+
+# 正常交易操作
+positions = user.position
+user.buy('300434', price=12.92, amount=100)
+
+# 运维巡检
+health = user.check_liveness()
+```
 
 ### 加微信群以及公众号
 
