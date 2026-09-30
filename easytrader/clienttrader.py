@@ -124,6 +124,9 @@ class ClientTrader(IClientTrader):
         primary_strategy=None,
         circuit_breaker: bool = True,
         on_fallback: Optional[Callable[[Dict], None]] = None,
+        timeout: float = 300.0,
+        think: bool = False,
+        options: Optional[Dict] = None,
         **kwargs,
     ):
         """
@@ -134,6 +137,9 @@ class ClientTrader(IClientTrader):
         :param primary_strategy: 首选网格策略，若为 None 则使用当前 grid_strategy_instance
         :param circuit_breaker: 是否启用熔断器，默认 True
         :param on_fallback: 触发降级时的回调函数 callback(fallback_info)
+        :param timeout: VLM 请求超时时间 (秒)，默认 300.0s (适应大模型冷加载)
+        :param think: 是否启用大模型思考链，默认 False (针对表格提取任务关闭以防截断并提速)
+        :param options: Ollama 选项参数 (如 {"num_predict": 2048, "temperature": 0})
         :param kwargs: 传递给 FallbackChain 的其他可选参数 (如 failure_threshold, recovery_timeout, artifact_dir, validator 等)
         :return: FallbackChain 实例
         """
@@ -149,7 +155,9 @@ class ClientTrader(IClientTrader):
             primary = primary_strategy
 
         ocr_strat = grid_strategies.ScreenshotOCR()
-        vlm_strat = grid_strategies.OllamaVLM(model=model, host=host)
+        vlm_strat = grid_strategies.OllamaVLM(
+            model=model, host=host, timeout=timeout, think=think, options=options
+        )
 
         # 构建策略阶梯: [primary, ScreenshotOCR, OllamaVLM]
         strategies = [primary]

@@ -962,11 +962,15 @@ class OllamaHttpBackend(IVLMBackend):
         self,
         model: str = "qwen2.5-vl:7b",
         host: str = "http://localhost:11434",
-        timeout: float = 60.0,
+        timeout: float = 300.0,
+        options: Optional[Dict[str, Any]] = None,
+        think: bool = False,
     ):
         self.model = model
         self.host = host.rstrip("/")
         self.timeout = timeout
+        self.think = think
+        self.options = options or {"num_predict": 2048, "temperature": 0}
 
     def request(self, image_bytes: bytes, prompt: str) -> str:
         url = f"{self.host}/api/generate"
@@ -977,6 +981,8 @@ class OllamaHttpBackend(IVLMBackend):
             "images": [b64_img],
             "stream": False,
             "format": "json",
+            "think": self.think,
+            "options": self.options,
         }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
@@ -1091,9 +1097,14 @@ class OllamaVLM(BaseStrategy):
         model: str = "qwen2.5-vl:7b",
         host: str = "http://localhost:11434",
         prompt: Optional[str] = None,
+        timeout: float = 300.0,
+        options: Optional[Dict[str, Any]] = None,
+        think: bool = False,
     ):
         super().__init__()
-        self.backend = backend or OllamaHttpBackend(model=model, host=host)
+        self.backend = backend or OllamaHttpBackend(
+            model=model, host=host, timeout=timeout, options=options, think=think
+        )
         self.prompt = prompt or DEFAULT_VLM_PROMPT
 
     def get(self, control_id: int, context: Optional[PipelineContext] = None) -> List[Dict]:

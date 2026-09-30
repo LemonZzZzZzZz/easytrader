@@ -323,9 +323,18 @@ class TestVLMBackends(unittest.TestCase):
         mock_resp.read.return_value = json.dumps({"response": '[{"证券代码": "000001"}]'}).encode("utf-8")
         mock_urlopen.return_value.__enter__.return_value = mock_resp
 
-        backend = OllamaHttpBackend(model="qwen2.5-vl:7b", host="http://localhost:11434")
+        backend = OllamaHttpBackend(model="qwen3.6:35b", host="http://localhost:11434")
+        self.assertEqual(backend.timeout, 300.0)
         result = backend.request(b"fake_image", "prompt")
         self.assertEqual(result, '[{"证券代码": "000001"}]')
+
+        # 验证发送的 HTTP 请求 payload 包含 think=False、format=json、options 等预算参数
+        req_arg = mock_urlopen.call_args[0][0]
+        sent_data = json.loads(req_arg.data.decode("utf-8"))
+        self.assertEqual(sent_data["model"], "qwen3.6:35b")
+        self.assertEqual(sent_data["format"], "json")
+        self.assertFalse(sent_data["think"])
+        self.assertEqual(sent_data["options"], {"num_predict": 2048, "temperature": 0})
 
     @patch("urllib.request.urlopen")
     def test_ollama_http_backend_error(self, mock_urlopen):
