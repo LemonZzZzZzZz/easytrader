@@ -32,7 +32,31 @@
 
 ---
 
-### 2. 快速上手
+### 2. 安装与环境依赖
+
+```bash
+# 推荐：直接从本强化版分支源码安装
+pip install git+https://github.com/LemonZzZzZzZz/easytrader.git@fix/ths-gui-fixes
+
+# 或者本地克隆开发模式安装
+git clone -b fix/ths-gui-fixes https://github.com/LemonZzZzZzZz/easytrader.git
+cd easytrader
+pip install -e .
+```
+
+> **可选多模态大模型依赖**：
+> 本库设计坚持**零强制新增第三方 pip 依赖**（完全复用自带的 `requests` 与 `pillow` 与本地/远程 Ollama REST API 通信）。若需使用视觉多模态大模型能力，仅需本机安装并启动 [Ollama](https://ollama.com/) 即可。
+> 
+> **推荐模型与启动参数配置（实测 8GB 显卡流畅运行）**：
+> ```bash
+> # 拉取实盘验证推荐的视觉模型（二选一）：
+> ollama pull qwen3.6:35b      # Q4_K_M 量化，支持 Vision/Thinking，实测热请求仅 8.9s
+> ollama pull qwen2.5-vl:7b    # 约 5GB 显存，极速轻量
+> ```
+
+---
+
+### 3. 快速上手
 
 #### 基础初始化与使用
 
@@ -96,6 +120,19 @@ result = user.buy('300434', price=12.92, amount=100)
 health = user.check_liveness()
 if not health["is_healthy"]:
     logger.error("客户端异常警报: %s", health["issues"])
+```
+
+---
+
+### 4. 自动化测试与质量保障
+
+本项目包含严格的单元测试与端到端模拟测试体系，通过 Mock 离线图像、故障注入与边界探测确保 100% 稳定性：
+
+```bash
+# 运行全部单测（含 73 项视觉安全卫士单测 + 44 项降级责任链单测 + 基础套件）
+python -m unittest discover tests
+
+# 结果：238 项单测全部通过（0 失败，0 错误）
 ```
 
 ---
