@@ -16,8 +16,8 @@ if sys.version_info <= (3, 5):
 
 def use(broker, debug=False, **kwargs):
     """用于生成特定的券商对象
-    :param broker: 券商名支持 
-        例如 ['miniqmt', 'xq', '雪球', 'gj_client', '国金客户端', "universal_client", "通用同花顺客户端", "ths", "同花顺客户端"] 等
+    :param broker: 券商/平台名支持 
+        例如 ['ths', '同花顺客户端', 'universal_client', '通用同花顺客户端', 'miniqmt', 'xq', '雪球'] 等
     :param debug: 控制 debug 日志的显示, 默认为 False
     :param initial_assets: [雪球参数] 控制雪球初始资金，默认为一百万
     :return the class of trader
@@ -34,35 +34,20 @@ def use(broker, debug=False, **kwargs):
     if broker.lower() in ["xq", "雪球"]:
         return XueQiuTrader(**kwargs)
 
-    if broker.lower() in ["yh_client", "银河客户端"]:
-        from .yh_clienttrader import YHClientTrader
-
-        return YHClientTrader()
-
-    if broker.lower() in ["ht_client", "华泰客户端"]:
-        from .ht_clienttrader import HTClientTrader
-
-        return HTClientTrader()
-
-    if broker.lower() in ["wk_client", "五矿客户端"]:
-        from easytrader.wk_clienttrader import WKClientTrader
-
-        return WKClientTrader()
-
-    if broker.lower() in ["htzq_client", "海通证券客户端"]:
-        from easytrader.htzq_clienttrader import HTZQClientTrader
-
-        return HTZQClientTrader()
-
-    if broker.lower() in ["gj_client", "国金客户端"]:
-        from .gj_clienttrader import GJClientTrader
-
-        return GJClientTrader()
-
-    if broker.lower() in ["gf_client", "广发客户端"]:
-        from .gf_clienttrader import GFClientTrader
-
-        return GFClientTrader()
+    # 已废弃的历史专用券商客户端
+    obsolete_brokers = {
+        "yh_client", "银河客户端",
+        "ht_client", "华泰客户端",
+        "wk_client", "五矿客户端",
+        "htzq_client", "海通证券客户端",
+        "gj_client", "国金客户端",
+        "gf_client", "广发客户端",
+    }
+    if broker.lower() in obsolete_brokers:
+        raise NotImplementedError(
+            f"客户端 '{broker}' 已废弃。因各券商独立版客户端升级导致私有登录与验证码机制失效，"
+            f"目前桌面端仅支持通用同花顺客户端 ('ths' 或 'universal_client')。"
+        )
 
     if broker.lower() in ["universal_client", "通用同花顺客户端"]:
         from easytrader.universal_clienttrader import UniversalClientTrader
@@ -83,7 +68,7 @@ def use(broker, debug=False, **kwargs):
 
         return MiniqmtTrader()
 
-    raise NotImplementedError
+    raise NotImplementedError(f"不支持的券商或平台类型: {broker}")
 
 
 def follower(platform, **kwargs):

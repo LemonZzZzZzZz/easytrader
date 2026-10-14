@@ -9,10 +9,7 @@ import pandas as pd
 
 from easytrader import (
     grid_strategies,
-    ht_clienttrader,
     universal_clienttrader,
-    htzq_clienttrader,
-    wk_clienttrader,
 )
 from easytrader.clienttrader import ClientTrader
 from easytrader.config import client
@@ -120,12 +117,16 @@ class TestClientConfig(unittest.TestCase):
 
     def test_balance_control_id_groups_validity(self):
         """测试各券商配置中的 BALANCE_CONTROL_ID_GROUP ID 均为正整数"""
-        for broker in ["ths", "universal", "ht", "htzq"]:
+        for broker in ["ths", "universal"]:
             cfg = client.create(broker)
             if hasattr(cfg, "BALANCE_CONTROL_ID_GROUP"):
                 for name, cid in cfg.BALANCE_CONTROL_ID_GROUP.items():
                     self.assertIsInstance(cid, int, f"{broker} 的 {name} 控件 ID 必须为整数")
                     self.assertGreater(cid, 0, f"{broker} 的 {name} 控件 ID 必须为正整数")
+
+        for obsolete in ["ht", "htzq", "yh", "gj", "gf", "wk"]:
+            with self.assertRaises(NotImplementedError):
+                client.create(obsolete)
 
     def test_grid_dtype_includes_string_fields(self):
         """测试 GRID_DTYPE 中核心业务字段均强制按字符串读取以避免精度或前导零丢失"""
@@ -463,10 +464,10 @@ class TestBalanceParsing(unittest.TestCase):
         self.assertEqual(result["资金余额"], 1234567.89)
         self.assertEqual(result["股票市值"], 1234567.89)
 
-    def test_ht_client_trader_inherits_robust_balance_parsing(self):
-        """测试 HTClientTrader 继承了安全的资金解析逻辑（容错与千分位）"""
-        ht = ht_clienttrader.HTClientTrader()
-        ht._main = MagicMock()
+    def test_universal_client_trader_inherits_robust_balance_parsing(self):
+        """测试 UniversalClientTrader 继承了安全的资金解析逻辑（容错与千分位）"""
+        user = universal_clienttrader.UniversalClientTrader()
+        user._main = MagicMock()
 
         def mock_child(control_id=None, class_name=None):
             if control_id == 1014:
@@ -475,9 +476,9 @@ class TestBalanceParsing(unittest.TestCase):
             ctrl.window_text.return_value = " 2,050,100.00 "
             return ctrl
 
-        ht._main.child_window.side_effect = mock_child
-        with patch.object(ht, "_switch_left_menus"):
-            balance = ht.balance
+        user._main.child_window.side_effect = mock_child
+        with patch.object(user, "_switch_left_menus"):
+            balance = user.balance
             self.assertEqual(balance["总资产"], 2050100.0)
             self.assertNotIn("股票市值", balance)
 
@@ -623,11 +624,8 @@ class TestTradeAndOrderInput(unittest.TestCase):
         self.assertTrue(self.trader._editor_need_type_keys)
 
     def test_subclasses_preserve_editor_need_type_keys_default(self):
-        """测试各券商客户端子类默认均继承 _editor_need_type_keys = True"""
-        for cls in [universal_clienttrader.UniversalClientTrader,
-                    ht_clienttrader.HTClientTrader,
-                    htzq_clienttrader.HTZQClientTrader,
-                    wk_clienttrader.WKClientTrader]:
+        """测试 UniversalClientTrader 默认继承 _editor_need_type_keys = True"""
+        for cls in [universal_clienttrader.UniversalClientTrader]:
             instance = cls()
             self.assertTrue(instance._editor_need_type_keys, f"{cls.__name__} 必须保留按键模式为 True")
 
