@@ -1,4 +1,9 @@
-# -*- coding: utf-8 -*-
+# 在 Windows 下若安装了 onnxruntime，需尽早导入以防止与 Win32/ctypes 模块发生 C++ 运行时 DLL 加载冲突
+try:
+    import onnxruntime
+except ImportError:
+    pass
+
 import urllib3
 
 from easytrader import exceptions

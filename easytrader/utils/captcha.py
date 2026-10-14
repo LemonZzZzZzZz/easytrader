@@ -4,25 +4,45 @@ import requests
 from PIL import Image
 
 from easytrader import exceptions
+from easytrader.log import logger
 
 
 def captcha_recognize(img_path):
-    import pytesseract
+    """
+    识别同花顺拷贝数据等验证码图片。
+    优先使用纯 Python/ONNX 的 ddddocr（无需外部依赖，识别率高）；
+    若未安装则降级至 pytesseract；
+    两者均不可用时抛出异常由上层清理弹窗并降级。
+    """
+    try:
+        import ddddocr
 
-    im = Image.open(img_path).convert("L")
-    # 1. threshold the image
-    threshold = 200
-    table = []
-    for i in range(256):
-        if i < threshold:
-            table.append(0)
-        else:
-            table.append(1)
+        ocr = ddddocr.DdddOcr(show_ad=False)
+        with open(img_path, "rb") as f:
+            img_bytes = f.read()
+        res = ocr.classification(img_bytes)
+        return str(res).strip() if res else ""
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug("ddddocr 识别异常: %s，尝试 pytesseract", e)
 
-    out = im.point(table, "1")
-    # 2. recognize with tesseract
-    num = pytesseract.image_to_string(out)
-    return num
+    try:
+        import pytesseract
+
+        im = Image.open(img_path).convert("L")
+        threshold = 200
+        table = [0 if i < threshold else 1 for i in range(256)]
+        out = im.point(table, "1")
+        num = pytesseract.image_to_string(out)
+        return str(num).strip()
+    except ImportError:
+        raise exceptions.TradeError(
+            "未检测到验证码识别组件（ddddocr 或 pytesseract）。"
+            "建议执行 `pip install ddddocr` 或切换至 `ScreenshotOCR` 策略彻底免疫剪贴板反爬验证码。"
+        )
+    except Exception as e:
+        raise exceptions.TradeError(f"验证码识别失败: {e}")
 
 
 def recognize_verify_code(image_path, broker="ths"):

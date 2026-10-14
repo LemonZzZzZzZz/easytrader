@@ -1609,6 +1609,46 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
                             self.assertFalse(os.path.exists(created_files[0]))
 
 
+    def test_copy_strategy_captcha_dialog_auto_dismissal_on_failure(self):
+        """测试 Copy 策略触发验证码弹窗且识别未闭环时，必须在 finally 中安全关闭弹窗并抛出 TradeError"""
+        Copy._need_captcha_reg = True
+        strategy = Copy()
+        strategy.set_trader(self.trader)
+
+        mock_top = MagicMock()
+        mock_static = MagicMock()
+        mock_static.exists.return_value = True
+        mock_top.window.return_value = mock_static
+
+        # 模拟验证码识别始终返回非 4 位或抛出异常
+        with patch.object(self.trader.app, "top_window", return_value=mock_top):
+            with patch("easytrader.grid_strategies.captcha_recognize", side_effect=Exception("OCR failed")):
+                from easytrader.exceptions import TradeError
+                with self.assertRaises(TradeError) as ctx:
+                    strategy._get_clipboard_data()
+                self.assertIn("验证码", str(ctx.exception))
+                # 验证 Button2 取消按钮被调用，确保弹窗不悬挂
+                mock_top.Button2.click.assert_called()
+
+    def test_captcha_recognize_missing_dependencies_raises_trade_error(self):
+        """测试在无 ddddocr 和 pytesseract 时 captcha_recognize 抛出指导性 TradeError"""
+        from easytrader.utils import captcha
+        from easytrader.exceptions import TradeError
+
+        with patch.dict("sys.modules", {"ddddocr": None, "pytesseract": None}):
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                f.write(b"dummy")
+                temp_img = f.name
+            try:
+                with self.assertRaises(TradeError) as ctx:
+                    captcha.captcha_recognize(temp_img)
+                self.assertIn("未检测到验证码识别组件", str(ctx.exception))
+            finally:
+                if os.path.exists(temp_img):
+                    os.remove(temp_img)
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

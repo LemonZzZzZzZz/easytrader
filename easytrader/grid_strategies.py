@@ -21,7 +21,7 @@ import pywinauto.keyboard
 import pywinauto
 import pywinauto.clipboard
 
-from easytrader.exceptions import CircuitBreakerOpenError, SchemaValidationError
+from easytrader.exceptions import CircuitBreakerOpenError, SchemaValidationError, TradeError
 from easytrader.log import logger
 from easytrader.utils.captcha import captcha_recognize
 from easytrader.utils.win_gui import SetForegroundWindow, ShowWindow, win32defines
@@ -149,10 +149,19 @@ class BaseStrategy(IGridStrategy):
             return records
         cleaned = []
         summary_keywords = ("汇总", "合计", "总计", "小计")
+        empty_placeholder_keywords = ("没有", "暂无", "无符合", "无数据", "当前没有")
         for row in records:
             if not isinstance(row, dict):
                 continue
             row_text = "".join(str(v) for v in row.values() if v is not None)
+            # 过滤界面空表居中水印文字（如“当前没有可撤委托单”、“暂无记录”等）
+            if any(kw in row_text for kw in empty_placeholder_keywords):
+                raw_code = row.get("证券代码")
+                code = str(raw_code).strip() if raw_code is not None else ""
+                if not code or not code.isdigit():
+                    logger.info("过滤表格空数据占位提示行: %s", row)
+                    continue
+
             if any(kw in row_text for kw in summary_keywords):
                 raw_code = row.get("证券代码")
                 code = str(raw_code).strip() if raw_code is not None else ""
@@ -202,50 +211,65 @@ class Copy(BaseStrategy):
 
     def _get_clipboard_data(self) -> str:
         if Copy._need_captcha_reg:
-            if (
-                    self._trader.app.top_window().window(class_name="Static", title_re="验证码").exists(timeout=1)
-            ):
-                file_path = "tmp.png"
+            try:
+                top_wnd = self._trader.app.top_window()
+                has_captcha = top_wnd.window(class_name="Static", title_re="验证码").exists(timeout=1)
+            except Exception:
+                has_captcha = False
+
+            if has_captcha:
+                file_path = os.path.join(tempfile.gettempdir(), f"easytrader_captcha_{int(time.time()*1000)}.png")
                 count = 5
                 found = False
-                while count > 0:
-                    self._trader.app.top_window().window(
-                        control_id=0x965, class_name="Static"
-                    ).capture_as_image().save(
-                        file_path
-                    )  # 保存验证码
+                try:
+                    while count > 0:
+                        try:
+                            top_wnd.window(
+                                control_id=0x965, class_name="Static"
+                            ).capture_as_image().save(file_path)
+                            captcha_num = captcha_recognize(file_path).strip()
+                            captcha_num = "".join(captcha_num.split())
+                            logger.info("captcha result-->" + captcha_num)
+                            if len(captcha_num) == 4:
+                                editor = top_wnd.window(control_id=0x964, class_name="Edit")
+                                editor.set_focus()
+                                self._trader.wait(0.1)
+                                self._trader.type_edit_control_keys(editor, captcha_num)
+                                self._trader.wait(0.1)
+                                top_wnd.type_keys("{ENTER}", pause=0.1)
+                                if not editor.exists(timeout=1):
+                                    logger.info("验证码验证成功-->" + captcha_num)
+                                    found = True
+                                    break
+                        except Exception as loop_ex:
+                            logger.warning("单次验证码识别处理异常: %s", loop_ex)
+                        count -= 1
+                        self._trader.wait(0.1)
+                        try:
+                            top_wnd.window(control_id=0x965, class_name="Static").click()
+                        except Exception:
+                            pass
+                finally:
+                    if not found:
+                        # 确保关闭验证码弹窗，防止残留阻塞整个桌面或遮挡视觉截屏
+                        try:
+                            top_wnd.Button2.click()
+                        except Exception:
+                            try:
+                                top_wnd.type_keys("{ESC}")
+                            except Exception:
+                                pass
+                    if os.path.exists(file_path):
+                        try:
+                            os.remove(file_path)
+                        except Exception:
+                            pass
 
-                    captcha_num = captcha_recognize(file_path).strip()  # 识别验证码
-                    captcha_num = "".join(captcha_num.split())
-                    logger.info("captcha result-->" + captcha_num)
-                    if len(captcha_num) == 4:
-                        editor = self._trader.app.top_window().window(
-                            control_id=0x964, class_name="Edit"
-                        ) # 验证码输入框
-                        editor.set_focus() # 焦点移到验证码输入框 (也可不聚焦防止键盘误触输入，不聚焦type_edit_control_keys也可正常输入)
-                        self._trader.wait(0.1) # 输入前短暂等待
-                        self._trader.type_edit_control_keys(
-                            editor,
-                            captcha_num
-                        )  # 模拟输入验证码
-
-                        self._trader.wait(0.1) # 输完后短暂等待
-                        self._trader.app.top_window().type_keys("{ENTER}", pause=0.1)  # 模拟发送enter，点击确定
-                        if not editor.exists(timeout=1):  # 窗体消失
-                            logger.info("验证码验证成功-->" + captcha_num)
-                            found = True
-                            break
-                    count -= 1
-                    self._trader.wait(0.1)
-                    self._trader.app.top_window().window(
-                        control_id=0x965, class_name="Static"
-                    ).click()
                 if not found:
-                    self._trader.app.top_window().Button2.click()  # 点击取消
-            else:
-                pass
-                # 不要将 Copy._need_captcha_reg 置为 False, 因为它是类方法, 一旦置为 False, 后续操作都不再进行验证码识别
-                # Copy._need_captcha_reg = False
+                    raise TradeError(
+                        "触发同花顺客户端拷贝数据验证码弹窗，且自动识别输入未能闭环。"
+                        "建议配置 ScreenshotOCR 策略以彻底规避剪贴板反爬验证码。"
+                    )
         count = 5
         last_error = None
         while count > 0:
