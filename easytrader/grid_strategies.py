@@ -318,13 +318,19 @@ class Xls(BaseStrategy):
                     os.remove(temp_path)
                 except Exception:
                     pass
+            # 无论成功或异常，若残留阻断弹窗（如另存为对话框或防爬验证码模态窗），安全关闭，防止遮挡毒化后续 OCR 截屏
+            if self._trader and hasattr(self._trader, "close_pop_dialog"):
+                try:
+                    self._trader.close_pop_dialog()
+                except Exception:
+                    pass
 
     def _format_grid_data(self, data: str) -> List[Dict]:
         with open(data, encoding="gbk", errors="replace") as f:
             content = f.read()
 
         if not content or not content.strip():
-            return []
+            raise IOError(f"导出表格文件为空 (0 字节)，可能是导出未完成、被弹窗阻断或文件损坏: {data}")
 
         try:
             dtype = self._trader.config.GRID_DTYPE if self._trader and hasattr(self._trader, "config") else None

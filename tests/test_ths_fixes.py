@@ -303,12 +303,29 @@ class TestGridDataFormatting(unittest.TestCase):
                 os.remove(temp_path)
 
     def test_xls_format_grid_data_empty_file(self):
-        """测试 Xls 策略在遇到 0 字节或纯空白文件时安全返回空列表 [] 而非抛出异常"""
+        """测试 Xls 策略在遇到 0 字节或纯空白文件时显式抛出 IOError，严禁将系统故障伪装成空表"""
         xls_strategy = Xls()
         xls_strategy.set_trader(self.trader)
 
         with tempfile.NamedTemporaryFile("w", encoding="gbk", delete=False, suffix=".xls") as f:
             f.write("")
+            temp_path = f.name
+
+        try:
+            with self.assertRaises(IOError) as ctx:
+                xls_strategy._format_grid_data(temp_path)
+            self.assertIn("0 字节", str(ctx.exception))
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_xls_format_grid_data_header_only_returns_empty_list(self):
+        """测试 Xls 策略在遇到仅有表头的合法空表时正常返回空列表 []"""
+        xls_strategy = Xls()
+        xls_strategy.set_trader(self.trader)
+
+        with tempfile.NamedTemporaryFile("w", encoding="gbk", delete=False, suffix=".xls") as f:
+            f.write("证券代码\t证券名称\t股票余额\t可用余额\n")
             temp_path = f.name
 
         try:
