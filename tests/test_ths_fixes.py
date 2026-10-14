@@ -939,8 +939,8 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
                                 self.trader.cancel_entrust("123456", verify_timeout=0.1)
                             self.assertIn("123456", str(ctx.exception))
 
-    def test_cancel_entrust_empty_grid_during_verify_raises_verification_error(self):
-        """测试撤单二次核对期间若表格返回 [] 严禁判定成功，必须触发 TradeVerificationError"""
+    def test_cancel_entrust_single_order_cleared_success(self):
+        """测试单笔委托撤单后表格变为空列表 [] 属于正常全部撤单清空，判定为成功"""
         fake_entrusts_before = [
             {"合同编号": "123456", "证券代码": "000001"},
         ]
@@ -949,17 +949,16 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
         with patch.object(self.trader, "refresh"):
             with patch.object(self.trader, "_cancel_entrust_by_double_click"):
                 with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
-                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok"}):
-                        with patch.object(
-                            ClientTrader,
-                            "cancel_entrusts",
-                            new_callable=PropertyMock,
-                            side_effect=[fake_entrusts_before, fake_entrusts_after],
-                        ):
-                            from easytrader.exceptions import TradeVerificationError
-                            with self.assertRaises(TradeVerificationError) as ctx:
-                                self.trader.cancel_entrust("123456", verify_timeout=0.1)
-                            self.assertIn("待撤列表为空", str(ctx.exception))
+                    with patch.object(
+                        ClientTrader,
+                        "cancel_entrusts",
+                        new_callable=PropertyMock,
+                        side_effect=[fake_entrusts_before, fake_entrusts_after],
+                    ):
+                        res = self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                        self.assertEqual(res.get("message"), "success")
+                        self.assertTrue(res.get("verified"))
+                        self.assertEqual(res.get("detail"), "cleared")
 
     def test_cancel_entrust_grid_exception_during_verify_raises_verification_error(self):
         """测试撤单二次核对期间若网格读取抛出系统异常，必须触发 TradeVerificationError"""
@@ -1338,27 +1337,108 @@ class TestDpiAndCancelAndOcr(unittest.TestCase):
                                 self.trader.cancel_entrust("123456", verify_timeout=0.1)
                             self.assertIn("合同编号", str(ctx.exception))
 
-    def test_cancel_entrust_empty_grid_includes_pop_result(self):
-        """测试撤单二次核对网格为空时抛出的 TradeVerificationError 包含 pop_result"""
+    def test_cancel_entrust_verify_timeout_includes_pop_result(self):
+        """测试撤单二次核对超时时抛出的 TradeVerificationError 包含 pop_result"""
         fake_entrusts_before = [
             {"合同编号": "123456", "证券代码": "000001"},
         ]
-        fake_entrusts_after = []
+        fake_entrusts_still = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
 
         with patch.object(self.trader, "refresh"):
             with patch.object(self.trader, "_cancel_entrust_by_double_click"):
                 with patch.object(self.trader, "is_exist_pop_dialog", return_value=False):
-                    with patch.object(self.trader, "_handle_pop_dialogs", return_value={"message": "ok", "pop_key": "val"}):
+                    with patch.object(self.trader, "_handle_cancel_pop_dialog", return_value={"message": "ok", "pop_key": "val", "is_rejected": False}):
                         with patch.object(
                             ClientTrader,
                             "cancel_entrusts",
                             new_callable=PropertyMock,
-                            side_effect=[fake_entrusts_before, fake_entrusts_after],
+                            side_effect=[fake_entrusts_before, fake_entrusts_still],
                         ):
                             from easytrader.exceptions import TradeVerificationError
                             with self.assertRaises(TradeVerificationError) as ctx:
                                 self.trader.cancel_entrust("123456", verify_timeout=0.1)
-                            self.assertEqual(ctx.exception.result.get("pop_result"), {"message": "ok", "pop_key": "val"})
+                            self.assertEqual(ctx.exception.result.get("pop_result"), {"message": "ok", "pop_key": "val", "is_rejected": False})
+
+    def test_adaptive_validator_empty_cancellable_with_market_value(self):
+        """测试当持股市值大于 0 时，空撤单表 (cancellable) 判定为有效，不误报假空表亦不触发熔断"""
+        from easytrader.grid_strategies import AdaptiveSchemaValidator
+        validator = AdaptiveSchemaValidator(self.trader)
+        res = validator.validate([], table_type="cancellable", market_value=99999.0)
+        self.assertTrue(res.is_valid)
+        self.assertEqual(res.table_type, "cancellable")
+
+    def test_cancel_entrust_visual_grounding_fallback(self):
+        """测试当网格策略抛出异常（如验证码阻断）时，平滑降级至视觉 OCR 定位并成功双击坐标"""
+        fake_coords = (120, 180)
+        with patch.object(self.trader, "refresh"):
+            with patch.object(
+                ClientTrader,
+                "cancel_entrusts",
+                new_callable=PropertyMock,
+                side_effect=IOError("Grid captcha blocked"),
+            ):
+                with patch.object(self.trader, "_locate_entrust_visually", return_value=fake_coords) as mock_locate:
+                    with patch.object(self.trader, "_handle_cancel_pop_dialog", return_value={"message": "success", "is_rejected": False}):
+                        # 模拟网格控件
+                        mock_grid_ctrl = MagicMock()
+                        mock_top_window = MagicMock()
+                        mock_top_window.child_window.return_value = mock_grid_ctrl
+                        with patch.object(self.trader._app, "top_window", return_value=mock_top_window):
+                            res = self.trader.cancel_entrust("6284977480", stock_code="300434", amount=100, verify_timeout=0.0)
+                            mock_locate.assert_called_once_with("6284977480", stock_code="300434", amount=100)
+                            mock_grid_ctrl.double_click.assert_called_once_with(coords=fake_coords)
+                            self.assertEqual(res.get("message"), "success")
+
+    def test_cancel_entrust_pop_error_caught_before_dismiss(self):
+        """测试当弹窗提示已成交不能撤单时，被精准捕获并抛出 TradeVerificationError，绝不盲目放行"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(
+                    ClientTrader,
+                    "cancel_entrusts",
+                    new_callable=PropertyMock,
+                    return_value=fake_entrusts_before,
+                ):
+                    with patch.object(
+                        self.trader,
+                        "_handle_cancel_pop_dialog",
+                        return_value={"message": "提示：该委托已成交，不能撤单", "is_rejected": True},
+                    ):
+                        from easytrader.exceptions import TradeVerificationError
+                        with self.assertRaises(TradeVerificationError) as ctx:
+                            self.trader.cancel_entrust("123456", verify_timeout=0.1)
+                        self.assertIn("已成交", str(ctx.exception))
+
+    def test_cancel_entrust_buy_order_unfreeze_balance_verification(self):
+        """测试买单撤单在网格数据读取失败时，凭借静态资金控件可用金额的增加判定撤单成功"""
+        fake_entrusts_before = [
+            {"合同编号": "123456", "证券代码": "000001"},
+        ]
+        with patch.object(self.trader, "refresh"):
+            with patch.object(self.trader, "_cancel_entrust_by_double_click"):
+                with patch.object(self.trader, "_handle_cancel_pop_dialog", return_value={"message": "success", "is_rejected": False}):
+                    # 第一次查 balance 可用金额 10000，撤单后查 balance 可用金额 12000 (增加 2000)
+                    with patch.object(
+                        ClientTrader,
+                        "balance",
+                        new_callable=PropertyMock,
+                        side_effect=[{"可用金额": 10000.0}, {"可用金额": 12000.0}],
+                    ):
+                        with patch.object(
+                            ClientTrader,
+                            "cancel_entrusts",
+                            new_callable=PropertyMock,
+                            side_effect=[fake_entrusts_before, IOError("grid read error")],
+                        ):
+                            res = self.trader.cancel_entrust("123456", order_type="buy", verify_timeout=0.5)
+                            self.assertEqual(res.get("message"), "success")
+                            self.assertTrue(res.get("verified"))
+                            self.assertIn("funds_unfrozen", res.get("detail", ""))
 
     def test_cancel_entrust_empty_or_whitespace_entrust_no_raises_value_error(self):
         """测试当传入空或纯空白委托编号时立即抛出 ValueError 严禁误匹配空单元格"""

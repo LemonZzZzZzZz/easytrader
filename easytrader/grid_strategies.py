@@ -784,10 +784,13 @@ class AdaptiveSchemaValidator:
                     logger.debug("Failed to query market value from trader statics: %s", e)
 
             # 若持股市值大于 0，且当前表格是持仓表（或未指定 table_type），则空表判定为假成功漏报
+            # 注意：若明确指定了 table_type in ("cancellable", "entrusts", "trades", "cancel")，空表属于正常业务状态，直接放行
             if target_mv is not None:
                 try:
                     target_mv_num = float(str(target_mv).replace(",", "").strip())
                     if target_mv_num > 0:
+                        if table_type in ("cancellable", "entrusts", "trades", "cancel"):
+                            return ValidationResult(True, table_type=table_type)
                         if table_type in (None, "position"):
                             return ValidationResult(
                                 False,
@@ -1235,7 +1238,12 @@ class FallbackChain(BaseStrategy):
         for s in self.strategies:
             s.set_trader(trader)
 
-    def get(self, control_id: int, context: Optional[PipelineContext] = None) -> List[Dict]:
+    def get(
+        self,
+        control_id: int,
+        context: Optional[PipelineContext] = None,
+        table_type: Optional[str] = None,
+    ) -> List[Dict]:
         if context is None:
             context = PipelineContext(control_id=control_id)
 
@@ -1259,10 +1267,12 @@ class FallbackChain(BaseStrategy):
             start_time = time.time()
             try:
                 sig = inspect.signature(strategy.get)
+                kwargs = {}
                 if "context" in sig.parameters:
-                    raw_records = strategy.get(control_id, context=context)
-                else:
-                    raw_records = strategy.get(control_id)
+                    kwargs["context"] = context
+                if "table_type" in sig.parameters:
+                    kwargs["table_type"] = table_type
+                raw_records = strategy.get(control_id, **kwargs)
             except Exception as e:
                 duration = time.time() - start_time
                 err_msg = f"{type(e).__name__}: {str(e)}"
@@ -1276,7 +1286,7 @@ class FallbackChain(BaseStrategy):
             duration = time.time() - start_time
 
             # 自适应契约验证
-            val_result = self.validator.validate(raw_records, trader=self._trader)
+            val_result = self.validator.validate(raw_records, trader=self._trader, table_type=table_type)
             if not val_result.is_valid:
                 err_msg = f"Validation failed: {val_result.error}"
                 logger.warning("Strategy %s output validation failed: %s", strat_name, err_msg)

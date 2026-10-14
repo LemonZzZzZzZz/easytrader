@@ -6,8 +6,10 @@ import os
 import re
 import sys
 import time
-from typing import Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
+import inspect
+import numpy as np
 import hashlib, binascii
 
 import easyutils
@@ -223,6 +225,19 @@ class ClientTrader(IClientTrader):
                 self._main = self._app.top_window()
         except Exception:
             self._main = self._app.top_window()
+        try:
+            from easytrader.utils.win_gui import ShowWindow, win32defines
+            hwnd = None
+            if hasattr(self._main, "handle") and isinstance(self._main.handle, int):
+                hwnd = self._main.handle
+            elif hasattr(self._main, "wrapper_object"):
+                w = self._main.wrapper_object()
+                if hasattr(w, "handle") and isinstance(w.handle, int):
+                    hwnd = w.handle
+            if hwnd and isinstance(hwnd, int):
+                ShowWindow(hwnd, win32defines.SW_MAXIMIZE)
+        except Exception as ex:
+            logger.debug("Maximize main window failed: %s", ex)
         self._init_toolbar()
 
     @property
@@ -261,123 +276,372 @@ class ClientTrader(IClientTrader):
     def position(self):
         self._switch_left_menus(["查询[F4]", "资金股票"])
 
-        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
+        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID, table_type="position")
 
     @property
     def today_entrusts(self):
         self._switch_left_menus(["查询[F4]", "当日委托"])
 
-        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
+        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID, table_type="entrusts")
 
     @property
     def today_trades(self):
         self._switch_left_menus(["查询[F4]", "当日成交"])
 
-        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
+        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID, table_type="trades")
 
     @property
     def cancel_entrusts(self):
         self.refresh()
         self._switch_left_menus(["撤单[F3]"])
 
-        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID)
+        return self._get_grid_data(self._config.COMMON_GRID_CONTROL_ID, table_type="cancellable")
+
+    def _locate_entrust_visually(self, entrust_no, stock_code=None, amount=None):
+        """
+        通过后台截屏与 OCR 视觉定位目标委托在 Grid 控件中的物理坐标 (x, y)
+        用于当结构化网格导出失败（如遇到剪贴板验证码、文件锁死）时的平滑视觉降级
+        """
+        try:
+            grid_ctrl = self._app.top_window().child_window(
+                control_id=self._config.COMMON_GRID_CONTROL_ID,
+                class_name="CVirtualGridCtrl",
+            )
+            wrapper = grid_ctrl.wrapper_object() if hasattr(grid_ctrl, "wrapper_object") else grid_ctrl
+            if not hasattr(wrapper, "capture_as_image"):
+                return None
+            grid_img = wrapper.capture_as_image()
+        except Exception as e:
+            logger.debug("Visual grid capture failed: %s", e)
+            return None
+
+        # 获取 OCR 引擎 (优先复用已有的 ScreenshotOCR 引擎)
+        ocr_engine = None
+        if hasattr(self, "grid_strategy_instance") and hasattr(self.grid_strategy_instance, "_get_ocr_engine"):
+            try:
+                ocr_engine = self.grid_strategy_instance._get_ocr_engine()
+            except Exception:
+                pass
+        if ocr_engine is None:
+            try:
+                from rapidocr_onnxruntime import RapidOCR
+                ocr_engine = RapidOCR()
+            except Exception:
+                return None
+
+        try:
+            img_np = np.array(grid_img)
+            ocr_result, _ = ocr_engine(img_np)
+        except Exception as e:
+            logger.debug("Visual OCR run failed: %s", e)
+            return None
+
+        if not ocr_result:
+            return None
+
+        clean_entrust = str(entrust_no).strip()
+        clean_code = str(stock_code)[-6:].strip() if stock_code else None
+        clean_amount = str(int(amount)).strip() if amount is not None else None
+
+        # 1. 优先根据合同编号精确/子串匹配
+        for box, text, score in ocr_result:
+            t = str(text).strip()
+            if clean_entrust in t or (len(clean_entrust) >= 6 and clean_entrust[-6:] in t):
+                cx = int(np.mean([pt[0] for pt in box]))
+                cy = int(np.mean([pt[1] for pt in box]))
+                return (cx, cy)
+
+        # 2. 若合同号被折叠遮挡，按证券代码 + 数量进行行对齐匹配
+        if clean_code:
+            code_candidates = []
+            for box, text, score in ocr_result:
+                t = str(text).strip()
+                if clean_code in t:
+                    cy = int(np.mean([pt[1] for pt in box]))
+                    code_candidates.append(cy)
+
+            if len(code_candidates) == 1:
+                match_cy = code_candidates[0]
+                scale = self.get_dpi_scale_factor()
+                target_x = int(self._config.CANCEL_ENTRUST_GRID_LEFT_MARGIN * scale)
+                return (target_x, match_cy)
+            elif len(code_candidates) > 1 and clean_amount:
+                for cand_cy in code_candidates:
+                    for box, text, score in ocr_result:
+                        if abs(np.mean([pt[1] for pt in box]) - cand_cy) <= 12:
+                            if clean_amount == str(text).strip():
+                                scale = self.get_dpi_scale_factor()
+                                target_x = int(self._config.CANCEL_ENTRUST_GRID_LEFT_MARGIN * scale)
+                                return (target_x, cand_cy)
+
+        # 3. 单单吸附启发式：若排除表头后仅存在 1 行数据
+        data_ys = []
+        for box, text, score in ocr_result:
+            cy = int(np.mean([pt[1] for pt in box]))
+            if cy > 35:
+                data_ys.append(cy)
+        if data_ys:
+            min_y, max_y = min(data_ys), max(data_ys)
+            if max_y - min_y < 20:
+                single_cy = int(np.mean(data_ys))
+                scale = self.get_dpi_scale_factor()
+                target_x = int(self._config.CANCEL_ENTRUST_GRID_LEFT_MARGIN * scale)
+                return (target_x, single_cy)
+
+        return None
+
+    def _handle_cancel_pop_dialog(self, max_retries=2):
+        """专门处理撤单确认与拒单弹窗，优先提取文本再点击确认/关闭"""
+        if not self.is_exist_pop_dialog():
+            return {"message": "success", "is_rejected": False}
+
+        dialog_text = ""
+        w = self._app.top_window()
+        try:
+            for static in w.children(class_name="Static"):
+                t = static.window_text().strip()
+                if t and t not in ("确定", "取消", "是", "否", "&Y", "&N"):
+                    dialog_text += t + " "
+        except Exception:
+            try:
+                dialog_text = w.window_text()
+            except Exception:
+                pass
+
+        error_keywords = ("失败", "不能", "无法", "不可", "错误", "已成交", "已成", "废单", "已撤", "不存在", "异常", "拒绝")
+        is_rejected = any(kw in dialog_text for kw in error_keywords)
+
+        retry = 0
+        while retry <= max_retries and self.is_exist_pop_dialog():
+            w = self._app.top_window()
+            clicked = False
+            for btn_title in ["是(Y)", "确定", "是(&Y)", "是", "确认"]:
+                try:
+                    btn = w[btn_title]
+                    if btn.exists():
+                        btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    pass
+            if not clicked:
+                try:
+                    w.type_keys("%Y", set_foreground=False)
+                except Exception:
+                    pass
+            self.wait(0.2)
+            if not self.is_exist_pop_dialog():
+                break
+            retry += 1
+
+        return {"message": dialog_text.strip() if dialog_text else "success", "is_rejected": is_rejected}
 
     @perf_clock
-    def cancel_entrust(self, entrust_no, max_retries=2, verify_timeout=2.0):
+    def cancel_entrust(
+        self,
+        entrust_no,
+        stock_code=None,
+        order_type=None,
+        amount=None,
+        max_retries=2,
+        verify_timeout=2.0,
+    ):
         if entrust_no is None or not str(entrust_no).strip():
             raise ValueError("entrust_no 不能为空")
 
         self.refresh()
+
+        # 买单在撤单前记录可用金额，用于买单撤单解冻核验
+        pre_avail = None
+        if order_type and str(order_type).lower().startswith("b"):
+            try:
+                bal = self.balance
+                if isinstance(bal, dict) and "可用金额" in bal:
+                    pre_avail = float(str(bal["可用金额"]).replace(",", ""))
+            except Exception as e:
+                logger.debug("Record pre_avail balance failed: %s", e)
+
+        # 1. 三级阶梯定位目标委托单
         target_idx = None
-        for i, entrust in enumerate(self.cancel_entrusts):
-            val = str(entrust.get(self._config.CANCEL_ENTRUST_ENTRUST_FIELD, "")).strip() if isinstance(entrust, dict) else ""
-            if val == str(entrust_no).strip():
-                target_idx = i
-                break
+        target_coords = None
+        grid_fetch_error = None
+        curr_entrusts = None
 
-        if target_idx is None:
-            return {"message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤"}
+        # Tier 1: 结构化网格数据提取
+        try:
+            curr_entrusts = self.cancel_entrusts
+        except Exception as e:
+            grid_fetch_error = e
+            logger.warning("获取待撤委托网格异常: %s", e)
 
-        self._cancel_entrust_by_double_click(target_idx)
-
-        # 点击确认弹窗，并增加重试机制避免首次点击未响应
-        retry = 0
-        while retry <= max_retries:
-            if self.is_exist_pop_dialog():
-                w = self._app.top_window()
-                clicked = False
-                for btn_title in ["是(Y)", "确定", "是(&Y)", "是"]:
-                    try:
-                        btn = w[btn_title]
-                        if btn.exists():
-                            btn.click()
-                            clicked = True
-                            break
-                    except Exception:
-                        pass
-                self.wait(0.2)
-                if clicked and not self.is_exist_pop_dialog():
+        if curr_entrusts is not None and isinstance(curr_entrusts, list):
+            entrust_field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+            for i, entrust in enumerate(curr_entrusts):
+                if not isinstance(entrust, dict):
+                    continue
+                for f_name in (entrust_field, "委托编号", "申请编号", "合同编号"):
+                    val = str(entrust.get(f_name, "")).strip()
+                    if val and val == str(entrust_no).strip():
+                        target_idx = i
+                        break
+                if target_idx is not None:
                     break
-            else:
-                break
-            retry += 1
 
-        pop_res = self._handle_pop_dialogs()
+            # 如果未通过合同号匹配到，且传入了 stock_code，尝试唯一匹配
+            if target_idx is None and stock_code:
+                code_matches = []
+                for i, entrust in enumerate(curr_entrusts):
+                    if not isinstance(entrust, dict):
+                        continue
+                    code_val = str(entrust.get("证券代码", "")).strip()
+                    if code_val and code_val.endswith(str(stock_code)[-6:]):
+                        if amount is not None:
+                            amt_val = str(entrust.get("委托数量", "")).strip()
+                            if amt_val == str(int(amount)):
+                                code_matches.append(i)
+                        else:
+                            code_matches.append(i)
+                if len(code_matches) == 1:
+                    target_idx = code_matches[0]
 
-        # 如果弹窗明确提示撤单失败或状态异常（如已成交、废单、不可撤单等），严禁误判为成功，必须立即抛出 TradeVerificationError
-        pop_msg = str(pop_res.get("message", "")).strip() if isinstance(pop_res, dict) else ""
-        error_keywords = ("失败", "不能", "无法", "不可", "错误", "已成交", "已成", "废单", "已撤", "不存在", "异常", "拒绝")
-        if any(kw in pop_msg for kw in error_keywords):
-            raise TradeVerificationError(
-                f"委托单 {entrust_no} 撤单状态异常: {pop_msg}",
-                result={"message": "rejected", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+        # Tier 2: 若网格失败或未匹配，平滑降级至视觉 OCR 定位
+        if target_idx is None:
+            target_coords = self._locate_entrust_visually(
+                entrust_no, stock_code=stock_code, amount=amount
             )
 
-        # 异步状态二次核对：短轮询确认目标单是否已从待撤列表中消失
+        # Tier 3: 门禁与 Fail-Loud
+        if target_idx is None and target_coords is None:
+            if curr_entrusts is not None and len(curr_entrusts) == 0:
+                return {
+                    "message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤",
+                    "reason": "empty_grid",
+                }
+            if curr_entrusts is not None and len(curr_entrusts) > 0:
+                return {
+                    "message": "委托单状态错误不能撤单, 该委托单可能已经成交或者已撤",
+                    "reason": "not_in_grid",
+                }
+            raise TradeVerificationError(
+                f"获取待撤列表异常且视觉定位失败，无法执行撤单: {grid_fetch_error}",
+                result={"message": "grid_error", "entrust_no": str(entrust_no), "verified": False},
+            )
+
+        # 执行双击撤单
+        if target_coords is not None:
+            grid_ctrl = self._app.top_window().child_window(
+                control_id=self._config.COMMON_GRID_CONTROL_ID,
+                class_name="CVirtualGridCtrl",
+            )
+            grid_ctrl.double_click(coords=target_coords)
+        else:
+            self._cancel_entrust_by_double_click(target_idx)
+
+        # 处理弹窗并捕获拒单报错
+        pop_res = self._handle_cancel_pop_dialog(max_retries=max_retries)
+        if not pop_res.get("is_rejected"):
+            try:
+                legacy_pop = self._handle_pop_dialogs()
+                if isinstance(legacy_pop, dict):
+                    legacy_msg = str(legacy_pop.get("message", "")).strip()
+                    error_keywords = ("失败", "不能", "无法", "不可", "错误", "已成交", "已成", "废单", "已撤", "不存在", "异常", "拒绝")
+                    if any(kw in legacy_msg for kw in error_keywords):
+                        pop_res = {"message": legacy_msg, "is_rejected": True}
+                    elif any(k in legacy_pop for k in ("pop_key", "result")):
+                        pop_res.update(legacy_pop)
+            except Exception:
+                pass
+
+        if pop_res.get("is_rejected"):
+            raise TradeVerificationError(
+                f"委托单 {entrust_no} 撤单状态异常: {pop_res['message']}",
+                result={
+                    "message": "rejected",
+                    "entrust_no": str(entrust_no),
+                    "verified": False,
+                    "pop_result": pop_res,
+                },
+            )
+
+        # 异步状态二次核对
         if verify_timeout > 0:
             start_t = time.time()
             last_grid_error = None
             while time.time() - start_t < verify_timeout:
                 self.refresh()
+                curr_entrusts = None
                 try:
                     curr_entrusts = self.cancel_entrusts
                 except Exception as e:
                     last_grid_error = e
-                    logger.warning("获取待撤列表异常: %s", e)
-                    self.wait(0.3)
-                    continue
+                    logger.warning("二次核对获取待撤列表异常: %s", e)
 
-                if not curr_entrusts:
-                    # 严禁将空网格误判为订单已被撤销
-                    last_grid_error = TradeVerificationError(
-                        f"待撤列表为空，无法确认委托单 {entrust_no} 是否已被成功撤销",
-                        result={"message": "empty_grid", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+                if curr_entrusts is not None and isinstance(curr_entrusts, list):
+                    # 1. 单笔挂单撤销清空：当前待撤列表变为空列表
+                    if len(curr_entrusts) == 0:
+                        return {
+                            "message": "success",
+                            "entrust_no": str(entrust_no),
+                            "verified": True,
+                            "detail": "cleared",
+                        }
+
+                    # 2. 正常核验：从待撤列表中已移除
+                    entrust_field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
+                    remaining = [
+                        str(e.get(entrust_field, "")).strip()
+                        for e in curr_entrusts
+                        if isinstance(e, dict)
+                    ]
+                    if not any(bool(r) for r in remaining):
+                        last_grid_error = TradeVerificationError(
+                            f"待撤列表未包含有效 {entrust_field} 数据，无法确认委托单 {entrust_no} 是否已被成功撤销",
+                            result={"message": "invalid_grid", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
+                        )
+                        self.wait(0.3)
+                        continue
+
+                    # 表格有效，清除瞬态异常
+                    last_grid_error = None
+                    if str(entrust_no).strip() not in remaining:
+                        return {
+                            "message": "success",
+                            "entrust_no": str(entrust_no),
+                            "verified": True,
+                        }
+
+                # 3. 买单资金解冻辅助核验 (仅当为买单且记录了 pre_avail 时)
+                if pre_avail is not None:
+                    try:
+                        bal = self.balance
+                        if isinstance(bal, dict) and "可用金额" in bal:
+                            curr_avail = float(str(bal["可用金额"]).replace(",", ""))
+                            if curr_avail > pre_avail + 0.01:
+                                return {
+                                    "message": "success",
+                                    "entrust_no": str(entrust_no),
+                                    "verified": True,
+                                    "detail": f"funds_unfrozen: {pre_avail} -> {curr_avail}",
+                                }
+                    except Exception as e:
+                        logger.debug("Check unfreeze balance failed: %s", e)
+
+                # 4. 视觉核验辅助 (当且仅当初始撤单即通过视觉定位完成且网格持续异常时)
+                if target_coords is not None and last_grid_error is not None:
+                    v_coords = self._locate_entrust_visually(
+                        entrust_no, stock_code=stock_code, amount=amount
                     )
-                    self.wait(0.3)
-                    continue
+                    if v_coords is None:
+                        return {
+                            "message": "success",
+                            "entrust_no": str(entrust_no),
+                            "verified": True,
+                            "detail": "visually_removed",
+                        }
 
-                # 显式断言表格获取有效（非空且包含有效合同编号），严禁将缺少字段的异常网格误判为撤单成功
-                entrust_field = self._config.CANCEL_ENTRUST_ENTRUST_FIELD
-                remaining = [
-                    str(e.get(entrust_field, "")).strip()
-                    for e in curr_entrusts
-                    if isinstance(e, dict)
-                ]
-                if not any(bool(r) for r in remaining):
-                    last_grid_error = TradeVerificationError(
-                        f"待撤列表未包含有效 {entrust_field} 数据，无法确认委托单 {entrust_no} 是否已被成功撤销",
-                        result={"message": "invalid_grid", "entrust_no": str(entrust_no), "verified": False, "pop_result": pop_res}
-                    )
-                    self.wait(0.3)
-                    continue
-
-                # 表格获取有效后，清除历史瞬态异常并核对委托单是否已消失
-                last_grid_error = None
-                if str(entrust_no).strip() not in remaining:
-                    return {"message": "success", "entrust_no": str(entrust_no), "verified": True}
                 self.wait(0.3)
 
-            logger.warning("委托单 %s 撤单后未能在 %ss 内确认从待撤列表中移除", entrust_no, verify_timeout)
+            logger.warning("委托单 %s 撤单后未能在 %ss 内确认移除", entrust_no, verify_timeout)
             if last_grid_error:
                 if isinstance(last_grid_error, TradeVerificationError):
                     raise last_grid_error
@@ -794,7 +1058,13 @@ class ClientTrader(IClientTrader):
                 self._config.TRADE_PRICE_CONTROL_ID, str(limit_price)
             )
 
-    def _get_grid_data(self, control_id):
+    def _get_grid_data(self, control_id, table_type=None):
+        try:
+            sig = inspect.signature(self.grid_strategy_instance.get)
+            if "table_type" in sig.parameters:
+                return self.grid_strategy_instance.get(control_id, table_type=table_type)
+        except Exception:
+            pass
         return self.grid_strategy_instance.get(control_id)
 
     def _type_keys(self, control_id, text):
