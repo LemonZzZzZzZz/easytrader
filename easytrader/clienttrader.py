@@ -716,24 +716,28 @@ class ClientTrader(IClientTrader):
 
     @perf_clock
     def repo(self, security, price, amount, **kwargs):
+        validate_trade_params(security, price, amount)
         self._switch_left_menus(["债券回购", "融资回购（正回购）"])
 
         return self.trade(security, price, amount)
 
     @perf_clock
     def reverse_repo(self, security, price, amount, **kwargs):
+        validate_trade_params(security, price, amount)
         self._switch_left_menus(["债券回购", "融劵回购（逆回购）"])
 
         return self.trade(security, price, amount)
 
     @perf_clock
     def buy(self, security, price, amount, **kwargs):
+        validate_trade_params(security, price, amount)
         self._switch_left_menus(["买入[F1]"])
 
         return self.trade(security, price, amount)
 
     @perf_clock
     def sell(self, security, price, amount, **kwargs):
+        validate_trade_params(security, price, amount)
         self._switch_left_menus(["卖出[F2]"])
 
         return self.trade(security, price, amount)
@@ -751,6 +755,7 @@ class ClientTrader(IClientTrader):
 
         :return: {'entrust_no': '委托单号'}
         """
+        validate_market_trade_params(security, amount, limit_price)
         self._switch_left_menus(["市价委托", "买入"])
 
         return self.market_trade(security, amount, ttype, limit_price=limit_price)
@@ -767,6 +772,7 @@ class ClientTrader(IClientTrader):
         :param limit_price: 科创板 限价
         :return: {'entrust_no': '委托单号'}
         """
+        validate_market_trade_params(security, amount, limit_price)
         self._switch_left_menus(["市价委托", "卖出"])
 
         return self.market_trade(security, amount, ttype, limit_price=limit_price)
@@ -783,9 +789,10 @@ class ClientTrader(IClientTrader):
         :return: {'entrust_no': '委托单号'}
         """
         # 入口校验（审查标准 5.2）：代码与数量合法性，非法参数不进入 GUI 流程
-        validate_market_trade_params(security, amount)
+        code, amount = validate_market_trade_params(
+            security, amount, limit_price
+        )
 
-        code = security[-6:]
         self._type_edit_control_keys(self._config.TRADE_SECURITY_CONTROL_ID, code)
         if ttype is not None:
             retry = 0
@@ -810,7 +817,7 @@ class ClientTrader(IClientTrader):
                         ttype, retry_max
                     )
                 )
-        self._set_market_trade_params(security, amount, limit_price=limit_price)
+        self._set_market_trade_params(code, amount, limit_price=limit_price)
         self._submit_trade()
 
         return self._handle_pop_dialogs(
@@ -962,7 +969,9 @@ class ClientTrader(IClientTrader):
     def trade(self, security, price, amount):
         # 入口校验（审查标准 5.2 双向校验之入口侧）：非法参数直接拒绝，
         # 不进入 GUI 点击流程，避免把错误数据敲进交易客户端
-        validate_trade_params(security, price, amount)
+        security, price, amount = validate_trade_params(
+            security, price, amount
+        )
 
         self._set_trade_params(security, price, amount)
 

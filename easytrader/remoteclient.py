@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import requests
 
-from easytrader.exceptions import TradeError
+from easytrader.exceptions import TradeError, TradeVerificationError
 from easytrader.utils.misc import HTTP_TIMEOUT, file2dict
 
 # 交易指令超时（秒）：买卖撤单会触发服务端 GUI 自动化，耗时显著长于查询
@@ -97,59 +97,46 @@ class RemoteClient:
             raise TradeError(response.json()["error"])
         return response.json()
 
-    def buy(self, security, price, amount, **kwargs):
-        params = locals().copy()
-        params.pop("self")
-
-        response = self._s.post(
-            self._api + "/buy", json=params, timeout=TRADE_HTTP_TIMEOUT
-        )
+    def _post_trade(self, endpoint, params):
+        try:
+            response = self._s.post(
+                self._api + "/" + endpoint,
+                json=params,
+                timeout=TRADE_HTTP_TIMEOUT,
+            )
+        except requests.Timeout as ex:
+            raise TradeVerificationError(
+                "远端下单/撤单请求超时，结果未知；请先查询委托状态，"
+                "确认后再决定是否重试"
+            ) from ex
         if response.status_code >= 300:
             raise TradeError(response.json()["error"])
         return response.json()
+
+    def buy(self, security, price, amount, **kwargs):
+        params = locals().copy()
+        params.pop("self")
+        return self._post_trade("buy", params)
 
     def sell(self, security, price, amount, **kwargs):
         params = locals().copy()
         params.pop("self")
-
-        response = self._s.post(
-            self._api + "/sell", json=params, timeout=TRADE_HTTP_TIMEOUT
-        )
-        if response.status_code >= 300:
-            raise TradeError(response.json()["error"])
-        return response.json()
+        return self._post_trade("sell", params)
 
     def market_buy(self, security, amount, **kwargs):
         params = locals().copy()
         params.pop("self")
 
-        response = self._s.post(
-            self._api + "/market_buy", json=params, timeout=TRADE_HTTP_TIMEOUT
-        )
-        if response.status_code >= 300:
-            raise TradeError(response.json()["error"])
-        return response.json()
+        return self._post_trade("market_buy", params)
 
     def market_sell(self, security, amount, **kwargs):
         params = locals().copy()
         params.pop("self")
 
-        response = self._s.post(
-            self._api + "/market_sell", json=params, timeout=TRADE_HTTP_TIMEOUT
-        )
-        if response.status_code >= 300:
-            raise TradeError(response.json()["error"])
-        return response.json()
+        return self._post_trade("market_sell", params)
 
     def cancel_entrust(self, entrust_no):
         params = locals().copy()
         params.pop("self")
 
-        response = self._s.post(
-            self._api + "/cancel_entrust",
-            json=params,
-            timeout=TRADE_HTTP_TIMEOUT,
-        )
-        if response.status_code >= 300:
-            raise TradeError(response.json()["error"])
-        return response.json()
+        return self._post_trade("cancel_entrust", params)

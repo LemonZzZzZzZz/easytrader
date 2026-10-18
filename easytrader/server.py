@@ -37,10 +37,21 @@ def _validate_trade_payload(json_data):
     security = json_data.get("security")
     if not isinstance(security, str) or not security.strip():
         raise ValueError("security 不能为空且必须为字符串")
+    volume = None
+    if "volume" in json_data:
+        volume = ensure_positive_number(json_data["volume"], "volume")
     if "price" in json_data:
-        ensure_positive_number(json_data["price"], "price")
+        price = json_data["price"]
+        if volume is not None and not isinstance(price, bool) and price == 0:
+            pass
+        else:
+            ensure_positive_number(price, "price")
     if "amount" in json_data:
-        ensure_positive_number(json_data["amount"], "amount")
+        amount = json_data["amount"]
+        if volume is not None and not isinstance(amount, bool) and amount == 0:
+            pass
+        else:
+            ensure_positive_number(amount, "amount")
     if not any(k in json_data for k in ("price", "volume")):
         # 仅有 amount 而无价格 / 成交量对同花顺（缺 price）与雪球
         # （volume = price * amount = 0）均为无效请求

@@ -9,7 +9,7 @@ import math
 import re
 
 # 6 位数字证券代码（A 股 / 债券回购等），兼容 sh / sz 前缀形式
-SECURITY_CODE_RE = re.compile(r"^\d{6}$")
+SECURITY_CODE_RE = re.compile(r"^[0-9]{6}$")
 
 
 def extract_security_code(security):
@@ -19,7 +19,9 @@ def extract_security_code(security):
     """
     if not isinstance(security, str):
         raise ValueError(
-            "证券代码不合法: {!r}，应为字符串（如 '600519' 或 'sh600519'）".format(security)
+            "证券代码不合法: {!r}，应为字符串（如 '600519' 或 'sh600519'）".format(
+                security
+            )
         )
     code = security.strip()
     if code[:2].lower() in ("sh", "sz"):
@@ -35,7 +37,9 @@ def validate_security_code(security):
     code = extract_security_code(security)
     if not SECURITY_CODE_RE.match(code):
         raise ValueError(
-            "证券代码不合法: {!r}，应为 6 位数字代码（可带 sh/sz 前缀）".format(security)
+            "证券代码不合法: {!r}，应为 6 位数字代码（可带 sh/sz 前缀）".format(
+                security
+            )
         )
     return code
 
@@ -45,15 +49,27 @@ def ensure_positive_number(value, name):
 
     :raises ValueError: 非数值、NaN、inf 或小于等于 0
     """
+    if isinstance(value, bool):
+        raise ValueError("{}不合法: {!r}，应为数值".format(name, value))
     try:
         num = float(value)
-    except (TypeError, ValueError) as ex:
-        raise ValueError("{}不合法: {!r}，应为数值".format(name, value)) from ex
+    except (TypeError, ValueError, OverflowError) as ex:
+        raise ValueError(
+            "{}不合法: {!r}，应为数值".format(name, value)
+        ) from ex
     if math.isnan(num) or math.isinf(num):
         raise ValueError("{}不合法: {!r}，应为有限数值".format(name, value))
     if num <= 0:
         raise ValueError("{}必须大于 0: {!r}".format(name, value))
     return num
+
+
+def ensure_positive_quantity(value, name):
+    """校验数量取整后仍大于零，避免小于 1 的数量被截成零下单。"""
+    quantity = ensure_positive_number(value, name)
+    if int(quantity) <= 0:
+        raise ValueError("{}取整后必须大于 0: {!r}".format(name, value))
+    return quantity
 
 
 def validate_trade_params(security, price, amount):
@@ -67,16 +83,18 @@ def validate_trade_params(security, price, amount):
     """
     code = validate_security_code(security)
     price_num = ensure_positive_number(price, "价格")
-    amount_num = ensure_positive_number(amount, "数量")
+    amount_num = ensure_positive_quantity(amount, "数量")
     return code, price_num, amount_num
 
 
-def validate_market_trade_params(security, amount):
+def validate_market_trade_params(security, amount, limit_price=None):
     """市价交易入口校验（market_buy / market_sell，无价格参数）。
 
     :return: (code, amount)，code 为 6 位字符串，amount 为正数
     :raises ValueError: 任一参数不合法
     """
     code = validate_security_code(security)
-    amount_num = ensure_positive_number(amount, "数量")
+    amount_num = ensure_positive_quantity(amount, "数量")
+    if limit_price is not None:
+        ensure_positive_number(limit_price, "限价")
     return code, amount_num

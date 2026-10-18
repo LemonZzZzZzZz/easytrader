@@ -12,7 +12,8 @@ from unittest.mock import MagicMock, patch
 
 from easytrader import server
 from easytrader.clienttrader import ClientTrader
-from easytrader.exceptions import TradeError
+from easytrader.exceptions import TradeError, TradeVerificationError
+from easytrader.remoteclient import RemoteClient
 from easytrader.utils.validation import (
     ensure_positive_number,
     extract_security_code,
@@ -48,6 +49,7 @@ class TestValidationHelpers(unittest.TestCase):
             "600519.SH",
             "sh60051",
             None,
+            "１２３４５６",
         ]:
             with self.assertRaises(ValueError):
                 validate_security_code(bad)
@@ -56,7 +58,15 @@ class TestValidationHelpers(unittest.TestCase):
         self.assertEqual(ensure_positive_number(100, "数量"), 100.0)
         self.assertEqual(ensure_positive_number("1800.12", "价格"), 1800.12)
         bad_values = [
-            0, -1, -0.001, "abc", "", None, float("nan"), float("inf")
+            0,
+            -1,
+            -0.001,
+            "abc",
+            "",
+            None,
+            True,
+            float("nan"),
+            float("inf"),
         ]
         for bad in bad_values:
             with self.assertRaises(ValueError):
@@ -80,12 +90,18 @@ class TestValidationHelpers(unittest.TestCase):
             validate_trade_params("600519", 1800.0, 0)
         with self.assertRaises(ValueError):
             validate_trade_params("600519", 1800.0, -100)
+        with self.assertRaises(ValueError):
+            validate_trade_params("600519", 1800.0, 0.9)
 
     def test_validate_market_trade_params(self):
         code, amount = validate_market_trade_params("688001", "200")
         self.assertEqual((code, amount), ("688001", 200.0))
         with self.assertRaises(ValueError):
             validate_market_trade_params("688001", -5)
+        with self.assertRaises(ValueError):
+            validate_market_trade_params("688001", 0.9)
+        with self.assertRaises(ValueError):
+            validate_market_trade_params("688001", 100, limit_price=0)
 
 
 class TestClientTraderEntryValidation(unittest.TestCase):
@@ -105,6 +121,7 @@ class TestClientTraderEntryValidation(unittest.TestCase):
             ("600519", -10.0, 100),  # 价格为负
             ("600519", 10.0, 0),  # 数量为零
             ("600519", 10.0, -100),  # 数量为负
+            ("600519", 10.0, 0.9),  # 数量取整后为零
         ]
         for args in invalid_cases:
             with patch.object(self.trader, "_set_trade_params") as mock_set:
@@ -122,15 +139,56 @@ class TestClientTraderEntryValidation(unittest.TestCase):
                         return_value={"message": "success"},
                     ):
                         res = self.trader.trade("sh600519", 1800.12, 100)
-        mock_set.assert_called_once_with("sh600519", 1800.12, 100)
+        mock_set.assert_called_once_with("600519", 1800.12, 100.0)
         mock_submit.assert_called_once()
         self.assertEqual(res["message"], "success")
+
+    def test_trade_normalizes_security_code_before_gui(self):
+        with patch.object(self.trader, "_set_trade_params") as mock_set:
+            with patch.object(self.trader, "_capture_screen_image"):
+                with patch.object(self.trader, "_submit_trade"):
+                    with patch.object(
+                        self.trader,
+                        "_handle_pop_dialogs",
+                        return_value={"message": "success"},
+                    ):
+                        self.trader.trade("  sh600519 ", 10, 100)
+        mock_set.assert_called_once_with("600519", 10.0, 100.0)
+
+    def test_buy_rejects_invalid_params_before_switching_menu(self):
+        with patch.object(self.trader, "_switch_left_menus") as mock_switch:
+            with self.assertRaises(ValueError):
+                self.trader.buy("600519", 10, 0.9)
+        mock_switch.assert_not_called()
+
+    def test_market_buy_rejects_invalid_limit_before_switching_menu(self):
+        with patch.object(self.trader, "_switch_left_menus") as mock_switch:
+            with self.assertRaises(ValueError):
+                self.trader.market_buy("688001", 100, limit_price=0)
+        mock_switch.assert_not_called()
 
     def test_market_trade_rejects_invalid_amount_without_gui(self):
         with patch.object(self.trader, "_type_edit_control_keys") as mock_type:
             with self.assertRaises(ValueError):
                 self.trader.market_trade("688001", 0)
             mock_type.assert_not_called()
+
+    def test_market_trade_uses_normalized_code(self):
+        with patch.object(self.trader, "_type_edit_control_keys") as mock_type:
+            with patch.object(
+                self.trader, "_set_market_trade_params"
+            ) as mock_params:
+                with patch.object(self.trader, "_submit_trade"):
+                    with patch.object(
+                        self.trader,
+                        "_handle_pop_dialogs",
+                        return_value={"message": "success"},
+                    ):
+                        self.trader.market_trade(" sh688001 ", 100)
+        mock_type.assert_called_once_with(
+            self.trader._config.TRADE_SECURITY_CONTROL_ID, "688001"
+        )
+        mock_params.assert_called_once_with("688001", 100.0, limit_price=None)
 
 
 class TestMarketTradeFailClosed(unittest.TestCase):
@@ -145,23 +203,21 @@ class TestMarketTradeFailClosed(unittest.TestCase):
     def test_market_trade_raises_after_retries_exhausted(self):
         """GUI 持续异常时重试耗尽后抛 TradeError，且不点击提交"""
         with patch.object(self.trader, "_type_edit_control_keys"):
+            with patch.object(self.trader, "_set_market_trade_params"):
                 with patch.object(
-                    self.trader, "_set_market_trade_params"
+                    self.trader,
+                    "_set_market_trade_type",
+                    side_effect=RuntimeError("控件未就绪"),
                 ):
-                    with patch.object(
-                        self.trader,
-                        "_set_market_trade_type",
-                        side_effect=RuntimeError("控件未就绪"),
-                    ):
-                        with patch.object(self.trader, "wait"):
-                            with patch.object(
-                                self.trader, "_submit_trade"
-                            ) as mock_submit:
-                                with self.assertRaises(TradeError):
-                                    self.trader.market_trade(
-                                        "688001", 200, ttype="最优五档成交剩余撤销"
-                                    )
-                                mock_submit.assert_not_called()
+                    with patch.object(self.trader, "wait"):
+                        with patch.object(
+                            self.trader, "_submit_trade"
+                        ) as mock_submit:
+                            with self.assertRaises(TradeError):
+                                self.trader.market_trade(
+                                    "688001", 200, ttype="最优五档成交剩余撤销"
+                                )
+                            mock_submit.assert_not_called()
 
     def test_market_trade_propagates_type_error_immediately(self):
         """市价类型不在候选项内是确定性错误，立即失败且不重试"""
@@ -235,6 +291,36 @@ class TestServerTradeValidation(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 400)
 
+    def test_volume_is_validated_and_zero_amount_is_allowed_with_volume(self):
+        user = self._set_user()
+        for volume in [0, -1, "invalid"]:
+            resp = self.client.post(
+                "/buy",
+                json={"security": "600519", "volume": volume, "amount": 0},
+            )
+            self.assertEqual(resp.status_code, 400, msg=str(volume))
+        invalid_payloads = [
+            {"security": "600519", "volume": 1000, "amount": False},
+            {"security": "600519", "price": -1, "volume": 1000, "amount": 0},
+        ]
+        for payload in invalid_payloads:
+            resp = self.client.post("/buy", json=payload)
+            self.assertEqual(resp.status_code, 400, msg=str(payload))
+
+        resp = self.client.post(
+            "/buy",
+            json={
+                "security": "600519",
+                "price": 0,
+                "volume": 1000,
+                "amount": 0,
+            },
+        )
+        self.assertEqual(resp.status_code, 201)
+        user.buy.assert_called_once_with(
+            security="600519", price=0, volume=1000, amount=0
+        )
+
     def test_cancel_entrust_rejects_empty_entrust_no(self):
         self._set_user()
         for payload in [{"entrust_no": ""}, {"entrust_no": "   "}, {}]:
@@ -248,6 +334,21 @@ class TestServerTradeValidation(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 201)
         user.cancel_entrust.assert_called_once_with(entrust_no="HT001")
+
+
+class TestRemoteClientTradeTimeout(unittest.TestCase):
+    def test_trade_timeout_reports_unknown_order_result(self):
+        import requests
+
+        client = RemoteClient("ths", "localhost")
+        with patch.object(
+            client._s, "post", side_effect=requests.Timeout()
+        ) as mock_post:
+            with self.assertRaises(TradeVerificationError) as ctx:
+                client.buy("600519", 10, 100)
+        self.assertIn("结果未知", str(ctx.exception))
+        self.assertIn("委托状态", str(ctx.exception))
+        self.assertEqual(mock_post.call_args.kwargs["timeout"], 30)
 
 
 if __name__ == "__main__":
