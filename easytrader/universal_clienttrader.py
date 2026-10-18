@@ -4,6 +4,8 @@ import pywinauto
 import pywinauto.clipboard
 
 from easytrader import grid_strategies
+from easytrader.exceptions import TradeError
+from easytrader.log import logger
 from . import clienttrader
 
 
@@ -31,13 +33,23 @@ class UniversalClientTrader(clienttrader.BaseLoginClientTrader):
         except Exception:
             self._app = pywinauto.Application().start(exe_path)
 
-            # wait login window ready
-            while True:
+            # wait login window ready（带超时上限，防止客户端启动失败时无限等待）
+            login_wait_timeout = 30
+            login_waited = 0
+            while login_waited < login_wait_timeout:
                 try:
                     login_window = pywinauto.findwindows.find_window(class_name='#32770', found_index=1)
                     break
-                except:
+                except Exception as e:
+                    logger.debug("等待登录窗口第 %d 秒: %s", login_waited + 1, e)
                     self.wait(1)
+                    login_waited += 1
+            else:
+                raise TradeError(
+                    "等待同花顺登录窗口超时（{} 秒），请检查客户端是否正常启动".format(
+                        login_wait_timeout
+                    )
+                )
 
             self.wait(1)
             self._app.window(handle=login_window).Edit1.set_focus()

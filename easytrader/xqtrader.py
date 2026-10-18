@@ -10,7 +10,7 @@ import requests
 
 from easytrader import exceptions, webtrader
 from easytrader.log import logger
-from easytrader.utils.misc import parse_cookies_str
+from easytrader.utils.misc import HTTP_TIMEOUT, parse_cookies_str
 
 
 class XueQiuTrader(webtrader.WebTrader):
@@ -98,7 +98,7 @@ class XueQiuTrader(webtrader.WebTrader):
         return virtual * self.multiple
 
     def _get_html(self, url):
-        return self.s.get(url).text
+        return self.s.get(url, timeout=HTTP_TIMEOUT).text
 
     def _search_stock_info(self, code):
         """
@@ -116,7 +116,9 @@ class XueQiuTrader(webtrader.WebTrader):
             "key": "47bce5c74f",
             "market": self.account_config["portfolio_market"],
         }
-        r = self.s.get(self.config["search_stock_url"], params=data)
+        r = self.s.get(
+            self.config["search_stock_url"], params=data, timeout=HTTP_TIMEOUT
+        )
         stocks = json.loads(r.text)
         stocks = stocks["stocks"]
         stock = None
@@ -130,9 +132,17 @@ class XueQiuTrader(webtrader.WebTrader):
         :return: 字典
         """
         data_rb = {'cube_symbol': portfolio_code}
-        rb = self.s.get(self.config["portfolio_url_new"], params=data_rb)
+        rb = self.s.get(
+            self.config["portfolio_url_new"],
+            params=data_rb,
+            timeout=HTTP_TIMEOUT,
+        )
         data_qt = {'code': portfolio_code}
-        qt = self.s.get(self.config["portfolio_quote"], params=data_qt)
+        qt = self.s.get(
+            self.config["portfolio_quote"],
+            params=data_qt,
+            timeout=HTTP_TIMEOUT,
+        )
         try:
             rebalance_info = json.loads(rb.text)
             quote_info = json.loads(qt.text)
@@ -232,7 +242,9 @@ class XueQiuTrader(webtrader.WebTrader):
             "count": 20,
             "page": 1,
         }
-        resp = self.s.get(self.config["history_url"], params=data)
+        resp = self.s.get(
+            self.config["history_url"], params=data, timeout=HTTP_TIMEOUT
+        )
         res = json.loads(resp.text)
         return res["list"]
 
@@ -383,7 +395,9 @@ class XueQiuTrader(webtrader.WebTrader):
         }
 
         try:
-            resp = self.s.post(self.config["rebalance_url"], data=data)
+            resp = self.s.post(
+                self.config["rebalance_url"], data=data, timeout=HTTP_TIMEOUT
+            )
         # pylint: disable=broad-except
         except Exception as e:
             logger.warning("调仓失败: %s ", e)
@@ -498,7 +512,9 @@ class XueQiuTrader(webtrader.WebTrader):
         }
 
         try:
-            resp = self.s.post(self.config["rebalance_url"], data=data)
+            resp = self.s.post(
+                self.config["rebalance_url"], data=data, timeout=HTTP_TIMEOUT
+            )
         # pylint: disable=broad-except
         except Exception as e:
             logger.warning("调仓失败: %s ", e)
@@ -625,7 +641,9 @@ class XueQiuTrader(webtrader.WebTrader):
             "comment": "",
         }
         try:
-            resp = self.s.post(self.config["rebalance_url"], data=data)
+            resp = self.s.post(
+                self.config["rebalance_url"], data=data, timeout=HTTP_TIMEOUT
+            )
         # pylint: disable=broad-except
         except Exception as e:
             logger.warning("调仓失败: %s ", e)

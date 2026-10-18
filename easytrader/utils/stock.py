@@ -5,6 +5,8 @@ import random
 
 import requests
 
+from easytrader.utils.misc import HTTP_TIMEOUT
+
 
 def get_stock_type(stock_code):
     """判断股票ID对应的证券市场
@@ -66,8 +68,12 @@ def get_today_ipo_data():
     )
 
     session = requests.session()
-    session.get(home_page_url, headers=send_headers)  # 产生cookies
-    ipo_response = session.post(ipo_data_url, headers=send_headers)
+    session.get(
+        home_page_url, headers=send_headers, timeout=HTTP_TIMEOUT
+    )  # 产生cookies
+    ipo_response = session.post(
+        ipo_data_url, headers=send_headers, timeout=HTTP_TIMEOUT
+    )
 
     json_data = json.loads(ipo_response.text)
     today_ipo = []

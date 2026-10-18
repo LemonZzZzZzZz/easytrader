@@ -8,7 +8,7 @@ from easytrader import logger
 
 try:
     from time import process_time
-except:
+except ImportError:  # Python 2 兼容：process_time 仅 Python 3 提供
     from time import clock as process_time
 
 

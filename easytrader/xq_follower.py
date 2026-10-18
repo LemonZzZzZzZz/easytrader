@@ -9,7 +9,7 @@ from threading import Thread
 
 from easytrader.follower import BaseFollower
 from easytrader.log import logger
-from easytrader.utils.misc import parse_cookies_str
+from easytrader.utils.misc import HTTP_TIMEOUT, parse_cookies_str
 
 
 class XueQiuFollower(BaseFollower):
@@ -39,7 +39,7 @@ class XueQiuFollower(BaseFollower):
         headers = self._generate_headers()
         self.s.headers.update(headers)
 
-        self.s.get(self.LOGIN_PAGE)
+        self.s.get(self.LOGIN_PAGE, timeout=HTTP_TIMEOUT)
 
         cookie_dict = parse_cookies_str(cookies)
         self.s.cookies.update(cookie_dict)
@@ -109,7 +109,7 @@ class XueQiuFollower(BaseFollower):
             try:
                 strategy_id = self.extract_strategy_id(strategy_url)
                 strategy_name = self.extract_strategy_name(strategy_url)
-            except:
+            except Exception:
                 logger.error("抽取交易id和策略名失败, 无效模拟交易url: %s", strategy_url)
                 raise
             strategy_worker = Thread(
@@ -138,7 +138,7 @@ class XueQiuFollower(BaseFollower):
     def extract_strategy_name(self, strategy_url):
         base_url = "https://xueqiu.com/cubes/nav_daily/all.json?cube_symbol={}"
         url = base_url.format(strategy_url)
-        rep = self.s.get(url)
+        rep = self.s.get(url, timeout=HTTP_TIMEOUT)
         info_index = 0
         return rep.json()[info_index]["name"]
 
@@ -231,7 +231,7 @@ class XueQiuFollower(BaseFollower):
         获取组合信息
         """
         url = self.PORTFOLIO_URL + portfolio_code
-        portfolio_page = self.s.get(url)
+        portfolio_page = self.s.get(url, timeout=HTTP_TIMEOUT)
         match_info = re.search(r"(?<=SNB.cubeInfo = ).*(?=;\n)", portfolio_page.text)
         if match_info is None:
             raise Exception("cant get portfolio info, portfolio url : {}".format(url))

@@ -5,6 +5,7 @@ from threading import Thread
 from easytrader import exceptions
 from easytrader.follower import BaseFollower
 from easytrader.log import logger
+from easytrader.utils.misc import HTTP_TIMEOUT
 
 
 class JoinQuantFollower(BaseFollower):
@@ -65,7 +66,7 @@ class JoinQuantFollower(BaseFollower):
             try:
                 strategy_id = self.extract_strategy_id(strategy_url)
                 strategy_name = self.extract_strategy_name(strategy_url)
-            except:
+            except Exception:
                 logger.error("抽取交易id和策略名失败, 无效的模拟交易url: %s", strategy_url)
                 raise
             strategy_worker = Thread(
@@ -89,11 +90,11 @@ class JoinQuantFollower(BaseFollower):
     #         r'(?<=title="点击修改策略名称"\>).*(?=\</span)', rep.content.decode("utf8")
     #     )
     def extract_strategy_id(self, strategy_url):
-        rep = self.s.get(strategy_url)
+        rep = self.s.get(strategy_url, timeout=HTTP_TIMEOUT)
         return self.re_search(r'name="backtest\[backtestId\]"\s+?value="(.*?)">', rep.content.decode("utf8"))
 
     def extract_strategy_name(self, strategy_url):
-        rep = self.s.get(strategy_url)
+        rep = self.s.get(strategy_url, timeout=HTTP_TIMEOUT)
         return self.re_search(r'class="backtest_name".+?>(.*?)</span>', rep.content.decode("utf8"))
 
     def create_query_transaction_params(self, strategy):

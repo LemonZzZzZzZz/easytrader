@@ -26,7 +26,7 @@ class WebTrader(metaclass=abc.ABCMeta):
         self.account_config = ""
         self.heart_active = True
         self.heart_thread = Thread(target=self.send_heartbeat)
-        self.heart_thread.setDaemon(True)
+        self.heart_thread.daemon = True
 
         self.log_level = logging.DEBUG if debug else logging.INFO
 

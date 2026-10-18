@@ -13,6 +13,7 @@ import requests
 
 from easytrader import exceptions
 from easytrader.log import logger
+from easytrader.utils.misc import HTTP_TIMEOUT
 
 
 class BaseFollower(metaclass=abc.ABCMeta):
@@ -48,11 +49,11 @@ class BaseFollower(metaclass=abc.ABCMeta):
         self.s.headers.update(headers)
 
         # init cookie
-        self.s.get(self.LOGIN_PAGE)
+        self.s.get(self.LOGIN_PAGE, timeout=HTTP_TIMEOUT)
 
         # post for login
         params = self.create_login_params(user, password, **kwargs)
-        rep = self.s.post(self.LOGIN_API, data=params)
+        rep = self.s.post(self.LOGIN_API, data=params, timeout=HTTP_TIMEOUT)
 
         self.check_login_success(rep)
         logger.info("登录成功")
@@ -358,7 +359,9 @@ class BaseFollower(metaclass=abc.ABCMeta):
     def query_strategy_transaction(self, strategy, **kwargs):
         params = self.create_query_transaction_params(strategy)
 
-        rep = self.s.get(self.TRANSACTION_API, params=params)
+        rep = self.s.get(
+            self.TRANSACTION_API, params=params, timeout=HTTP_TIMEOUT
+        )
         history = rep.json()
 
         transactions = self.extract_transactions(history)

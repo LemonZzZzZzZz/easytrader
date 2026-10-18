@@ -137,8 +137,8 @@ class BaseStrategy(IGridStrategy):
                 ShowWindow(grid.wrapper_object(), 9)  # restore window state
             else:
                 SetForegroundWindow(grid.wrapper_object())  # bring to front
-        except:
-            pass
+        except Exception as e:
+            logger.debug("设置前台窗口失败（窗口可能已关闭）: %s", e)
 
     @staticmethod
     def _filter_summary_rows(records: List[Dict]) -> List[Dict]:
