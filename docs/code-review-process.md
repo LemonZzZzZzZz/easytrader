@@ -155,7 +155,7 @@ pipenv run type_check            # mypy
 > - 另有一个与 Python 版本无关的硬约束：`pandas==0.23.3` 的旧版元数据无法被 pip>=24.1 解析（报错提示 `Please use pip<24.1`），CI 中已固定 `pip<24.1`。
 > 若 runner 清单下架 3.6：**不能简单降到 3.7/3.8**（lxml 3.7、pandas 3.8+ 均无 wheel），只能走"升级依赖钉版"路线。
 >
-> **手动触发的分支限制（2026-10-18 第三轮复审补充）**：`workflow_dispatch` 只能触发默认分支（master）上的 workflow。本文件当前在 `fix/ths-gui-fixes` 分支，仅推送该分支不会出现在 Actions 页面的 Run workflow 列表中。runner 验证二选一：① 先合入 master 再到 Actions → CI → Run workflow；② 暂不合并时把 `on` 临时改为 `[workflow_dispatch, pull_request]`，开一次 PR 验证后改回 `[workflow_dispatch]` 再合入。两种路径的详细说明已写入 `ci.yml` 文件头注释。
+> **手动触发的分支限制（2026-10-18 第三轮复审补充；第四轮复审据 GitHub 官方文档校正）**：`workflow_dispatch` 只能触发默认分支（master）上的 workflow。本文件当前在 `fix/ths-gui-fixes` 分支，仅推送该分支不会出现在 Actions 页面的 Run workflow 列表中。runner 验证二选一：① 先合入 master 再到 Actions → CI → Run workflow；② 暂不合并时把 `on` 临时改为 `[workflow_dispatch, pull_request]`，开一次 PR 验证后改回 `[workflow_dispatch]` 再合入——`pull_request` 事件使用 PR 的 merge ref（`refs/pull/N/merge`）中的 workflow 版本，分支内的 ci.yml 会直接生效，"须在默认分支"的限制不适用于 `pull_request` / `push`（GitHub 文档：events-that-trigger-workflows）；此外 workflow 运行过一次后即可通过 API / gh CLI 对任意分支手动触发。详细说明已写入 `ci.yml` 文件头注释。
 
 ## 9. 落地路线图
 
