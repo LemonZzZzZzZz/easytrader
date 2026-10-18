@@ -19,7 +19,16 @@
 #   6. 所有步骤显式 shell: bash，避免 Windows runner 默认 shell 歧义。
 #
 # 仍未验证：Python 3.6 runner 上的实际安装与测试结果（本机无 3.6）。
-# 使用方式：推送到仓库后，到 Actions 页面对本 workflow 手动 Run workflow。
+#
+# 使用方式（2026-10-18 第三轮复审补充）：workflow_dispatch 只能手动触发存在于
+# 【默认分支】上的 workflow，本仓库默认分支为 master。本文件当前在
+# fix/ths-gui-fixes 分支，仅推送该分支不会出现在 Actions 页面的 Run workflow
+# 列表中。验证路径二选一：
+#   A. 先将本 workflow 合入 master（建议与审查机制一并合入），再到
+#      Actions → CI → Run workflow 选择目标分支运行；
+#   B. 暂不合并时：将 on 临时改为 [workflow_dispatch, pull_request]，
+#      对本分支开一次 PR 完成验证，跑完后改回 [workflow_dispatch] 再合入。
+# 验证通过后，才切换为 on: [push, pull_request] 作为正式门禁。
 
 name: CI
 

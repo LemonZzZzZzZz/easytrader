@@ -19,7 +19,7 @@
 
 ## 作者自检清单
 
-- [ ] 本地 `make test` 通过（EZ_TEST_CLIENTS 允许时跑全量）
+- [ ] 本地 `make test` 通过（全量离线单测：全部 mock、无网络与真实账号依赖；依赖 pywinauto，需在 Windows 环境运行）
 - [ ] `pipenv run lint` / `format` / `sort_imports` / `type_check` 无新增告警
 - [ ] 新行为/修复已补充测试（无法测试的请在备注中说明原因）
 - [ ] 无凭据/密钥/资金账号信息入库（account.json、*.session 等已由 .gitignore 覆盖）
