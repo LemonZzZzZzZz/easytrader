@@ -27,6 +27,10 @@ from easytrader.log import logger
 from easytrader.refresh_strategies import IRefreshStrategy
 from easytrader.utils.misc import file2dict
 from easytrader.utils.perf import perf_clock
+from easytrader.utils.validation import (
+    validate_market_trade_params,
+    validate_trade_params,
+)
 from easytrader.utils.win_gui import get_window_dpi_scale
 
 if not sys.platform.startswith("darwin"):
@@ -699,8 +703,8 @@ class ClientTrader(IClientTrader):
                             btn.click()
                             clicked = True
                             break
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("点击弹窗按钮 %s 失败: %s", btn_name, e)
                 self.wait(0.2)
                 if clicked and not self.is_exist_pop_dialog():
                     break
@@ -778,6 +782,9 @@ class ClientTrader(IClientTrader):
 
         :return: {'entrust_no': '委托单号'}
         """
+        # 入口校验（审查标准 5.2）：代码与数量合法性，非法参数不进入 GUI 流程
+        validate_market_trade_params(security, amount)
+
         code = security[-6:]
         self._type_edit_control_keys(self._config.TRADE_SECURITY_CONTROL_ID, code)
         if ttype is not None:
@@ -787,9 +794,22 @@ class ClientTrader(IClientTrader):
                 try:
                     self._set_market_trade_type(ttype)
                     break
-                except:
+                except TypeError:
+                    # 市价类型不在候选项内属于确定性错误，重试无意义，立即失败
+                    raise
+                except Exception as e:
+                    # GUI 控件未就绪等瞬时故障才重试
+                    logger.debug("设置市价委托类型第 %d 次重试: %s", retry + 1, e)
                     retry += 1
                     self.wait(0.1)
+            else:
+                # 重试耗尽仍未设置成功：绝不在委托类型未确认时提交，
+                # 防止以错误的市价类型成交（资金路径正确性）
+                raise TradeError(
+                    "市价委托类型设置失败: {}（已重试 {} 次），已取消提交".format(
+                        ttype, retry_max
+                    )
+                )
         self._set_market_trade_params(security, amount, limit_price=limit_price)
         self._submit_trade()
 
@@ -910,7 +930,7 @@ class ClientTrader(IClientTrader):
                 timings.TimeoutError,
                 RuntimeError,
         ) as ex:
-            pass
+            logger.debug("关闭弹窗窗口失败（可能无弹窗或已关闭）: %s", ex)
 
     def _run_exe_path(self, exe_path):
         return os.path.join(os.path.dirname(exe_path), "xiadan.exe")
@@ -927,7 +947,7 @@ class ClientTrader(IClientTrader):
         for window in self._app.windows(class_name="#32770", visible_only=True):
             title = window.window_text()
             if title != self._config.TITLE and title_target not in title:
-                logging.info("close window %s" % title)
+                logger.info("close window %s", title)
                 window.close()
                 self.wait(0.2)
         self.wait(1)
@@ -940,6 +960,10 @@ class ClientTrader(IClientTrader):
                 window.close()
 
     def trade(self, security, price, amount):
+        # 入口校验（审查标准 5.2 双向校验之入口侧）：非法参数直接拒绝，
+        # 不进入 GUI 点击流程，避免把错误数据敲进交易客户端
+        validate_trade_params(security, price, amount)
+
         self._set_trade_params(security, price, amount)
 
         # 针对早盘高并发无回执阶段，在下单提交前预先抓取操作区双帧的前帧 (frame_before)
