@@ -7,6 +7,9 @@ nav:
   - 雪球组合模拟交易: xueqiu.md
   - 远端服务模式: remote.md
   - 策略跟踪: follow.md
+  - 工程规范:
+    - 代码审查标准: code-review-standards.md
+    - 代码审查流程: code-review-process.md
 theme: readthedocs
 markdown_extensions:
   - toc:

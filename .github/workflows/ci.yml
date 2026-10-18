@@ -1,0 +1,73 @@
+# CI 门禁草案 v3（2026-10-18 第二轮代码审查后修订）
+#
+# v3 变更（均基于 2026-10-18 实测证据）：
+#   1. 触发条件改为仅 workflow_dispatch（手动）：当前安装与测试尚未在 runner
+#      上验证，提交即自动运行的方案不可接受。验证通过后再改为
+#      on: [push, pull_request]。
+#   2. 不再走 requirements.txt 中的 HTTP 镜像：实测 requirements 文件内的 -i
+#      优先级高于命令行 --index-url（文件配置胜出），因此 CI 中生成剔除
+#      -i / --trusted-host 的净化清单，统一从 https://pypi.org/simple 安装，
+#      消除 HTTP 明文与 trusted-host 的供应链风险。
+#   3. 固定 pip<24.1：pandas==0.23.3 的旧版元数据无法被 pip>=24.1 解析
+#      （实测报错 "Please use pip<24.1"），不固定则安装必失败。
+#   4. 固定检查工具版本：black==18.6b4 对齐 Pipfile；pylint/isort 版本为示例，
+#      正式启用时按团队 pipenv lock 结果对齐。
+#   5. Python 3.6 的依据（2026-10-18 对 pypi.org 实测，win_amd64）：
+#      lxml==4.2.3 仅有 cp36 wheel（3.7 无）；pandas==0.23.3 有 cp36/cp37、
+#      无 cp38+；numpy==1.15.0、Pillow==5.2.0 有 cp36/cp37。
+#      若 runner 清单下架 3.6，不能简单降级到 3.7/3.8，需先升级依赖钉版。
+#   6. 所有步骤显式 shell: bash，避免 Windows runner 默认 shell 歧义。
+#
+# 仍未验证：Python 3.6 runner 上的实际安装与测试结果（本机无 3.6）。
+# 使用方式：推送到仓库后，到 Actions 页面对本 workflow 手动 Run workflow。
+
+name: CI
+
+on: [workflow_dispatch]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.6"
+
+      - name: 固定 pip 版本（pandas 0.23.3 旧元数据需要 pip<24.1）
+        shell: bash
+        run: python -m pip install --upgrade "pip<24.1"
+
+      - name: 生成净化版依赖清单并安装（官方 PyPI HTTPS）
+        shell: bash
+        run: |
+          grep -vE '^(-i |--trusted-host)' requirements.txt > requirements-ci.txt
+          grep -vE '^-r ' test-requirements.txt > test-requirements-ci.txt
+          pip install --index-url https://pypi.org/simple \
+            -r requirements-ci.txt -r test-requirements-ci.txt
+
+      - name: 运行测试（硬门禁）
+        shell: bash
+        run: pytest -v --cov=easytrader tests
+
+      - name: pylint 静态检查（提示模式）
+        shell: bash
+        continue-on-error: true
+        run: |
+          pip install --index-url https://pypi.org/simple "pylint==2.13.9"
+          pylint easytrader --rcfile=.pylintrc
+
+      - name: black 格式检查（提示模式）
+        shell: bash
+        continue-on-error: true
+        run: |
+          pip install --index-url https://pypi.org/simple "black==18.6b4"
+          black -l 79 --check .
+
+      - name: isort 导入顺序检查（提示模式）
+        shell: bash
+        continue-on-error: true
+        run: |
+          pip install --index-url https://pypi.org/simple "isort==5.11.5"
+          isort --check-only .
