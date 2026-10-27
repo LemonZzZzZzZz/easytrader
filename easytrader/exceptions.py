@@ -27,7 +27,12 @@ class CircuitBreakerOpenError(IOError):
 
 class HumanInterventionRequiredError(TradeError):
     """当识别到图形验证码 (CAPTCHA) 或需要人工介入的阻断弹窗时触发熔断报警"""
-    pass
+
+    def __init__(self, message=None, result=None):
+        super(HumanInterventionRequiredError, self).__init__(message)
+        # 与 TradeVerificationError / VisualArbitrationError 对齐：携带结构化现场
+        # （dialog_title / dialog_content / screenshot），供调用方告警与排查。
+        self.result = result
 
 
 class VisualArbitrationError(TradeError):

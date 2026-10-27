@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import abc
+import datetime
 import functools
 import logging
 import os
@@ -36,6 +37,26 @@ from easytrader.utils.win_gui import get_window_dpi_scale
 if not sys.platform.startswith("darwin"):
     import pywinauto
     import pywinauto.clipboard
+
+# 弹窗「同标题无进展」提前熔断阈值（env 可覆盖，越界收敛到 [1, max_attempts]）
+MAX_STAGNANT_DIALOG_ROUNDS_ENV = "EASYTRADER_MAX_STAGNANT_DIALOG_ROUNDS"
+DEFAULT_MAX_STAGNANT_DIALOG_ROUNDS = 4
+
+
+def _resolve_max_stagnant(max_attempts):
+    """解析「同标题连续无进展」提前熔断阈值。
+
+    2026-10-27 真机事故：未知内容弹窗使 _handle_pop_dialogs 空转满 10 轮，
+    耗时 18.3s（正常委托基线 6.4s）后委托被丢弃。阈值收紧可显著缩短空转，
+    但过小可能误伤响应偏慢的客户端，故保留 env 覆盖与上下界收敛。
+    """
+    raw = os.environ.get(MAX_STAGNANT_DIALOG_ROUNDS_ENV, "")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = DEFAULT_MAX_STAGNANT_DIALOG_ROUNDS
+    return max(1, min(value, int(max_attempts)))
+
 
 class IClientTrader(abc.ABC):
     @property
@@ -1353,17 +1374,52 @@ class ClientTrader(IClientTrader):
         return LivenessReport(is_alive=True, state="HEALTHY")
 
     @perf_clock
+    def _capture_dialog_evidence(self, title=None):
+        """把当前弹窗截图落盘存证，返回路径（失败返回空串，绝不阻断）。"""
+        shot_dir = (
+            os.environ.get(pop_dialog_handler.DIALOG_SHOT_DIR_ENV)
+            or pop_dialog_handler.DIALOG_SHOT_DIR_DEFAULT
+        )
+        try:
+            os.makedirs(shot_dir, exist_ok=True)
+            safe_title = re.sub(
+                r"[^0-9A-Za-z\u4e00-\u9fa5]+", "_", str(title or "dialog")
+            ).strip("_")[:24] or "dialog"
+            filename = "{}_{}.png".format(
+                safe_title,
+                datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3],
+            )
+            path = os.path.join(shot_dir, filename)
+            self._capture_window_image(self._app.top_window()).save(path)
+            return path
+        except Exception as ex:  # noqa: BLE001 存证失败不得影响交易
+            logger.debug("弹窗存证截图失败: %s", ex)
+            return ""
+
+    @perf_clock
     def _handle_pop_dialogs(self, handler_class=pop_dialog_handler.PopDialogHandler):
         handler = handler_class(self._app)
         max_attempts = 10
+        # 同标题连续「无进展」轮数上限：超过即提前熔断，不再空转满 10 轮。
+        # 2026-10-27 真机实测：空转 18.3s（正常委托基线 6.4s）后才超时丢单。
+        # 可用 env 覆盖（调试/兼容慢客户端），越界自动收敛到 [1, max_attempts]。
+        max_stagnant = _resolve_max_stagnant(max_attempts)
         attempt = 0
+        last_title = None
+        stagnant = 0
+        trace = []
 
         while self.is_exist_pop_dialog():
             attempt += 1
             if attempt > max_attempts:
                 raise TradeVerificationError(
                     f"处理弹窗超过最大尝试次数 ({max_attempts})，防止无限循环",
-                    result={"message": "dialog_dismiss_timeout"},
+                    result={
+                        "message": "dialog_dismiss_timeout",
+                        "dialog_title": last_title,
+                        "dialog_trace": trace,
+                        "screenshot": self._capture_dialog_evidence(last_title),
+                    },
                 )
 
             title = None
@@ -1383,6 +1439,33 @@ class ClientTrader(IClientTrader):
                     self._arbitrate_and_dismiss_modal_dialog()
                     continue
                 raise
+
+            trace.append({"attempt": attempt, "title": title, "result": result})
+
+            # 无进展检测：同标题且 handler 未返回有效结果 ⇒ 循环体等于空操作。
+            # 原实现会一直空转到第 11 轮才抛异常，期间委托状态完全未知。
+            if result is None and title == last_title:
+                stagnant += 1
+            else:
+                stagnant = 0
+            last_title = title
+
+            if stagnant >= max_stagnant:
+                logger.error(
+                    "弹窗连续 %d 轮无进展（title=%r），提前熔断避免无效空转",
+                    stagnant + 1,
+                    title,
+                )
+                raise TradeVerificationError(
+                    f"弹窗连续 {stagnant + 1} 轮无进展"
+                    f"（title={title!r}），提前熔断避免无效空转",
+                    result={
+                        "message": "dialog_stagnant",
+                        "dialog_title": title,
+                        "dialog_trace": trace,
+                        "screenshot": self._capture_dialog_evidence(title),
+                    },
+                )
 
             if result and not ("unknown message" in str(result.get("message", ""))):
                 return result
