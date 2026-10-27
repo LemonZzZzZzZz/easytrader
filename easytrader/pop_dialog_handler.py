@@ -20,6 +20,15 @@ DIALOG_SHOT_DIR_DEFAULT = os.path.join("logs", "ths_dialogs")
 class PopDialogHandler:
     def __init__(self, app):
         self._app = app
+        # 「本轮已对弹窗执行过关闭动作」标记。⚠️ 仅供 ClientTrader._handle_pop_dialogs
+        # 区分「已动作、正在等弹窗消失」与「什么动作都没做」——后者才是空转死循环。
+        # 2026-10-27 真机事故就是因为两者都表现为 return None，被混为一谈。
+        self.last_action_taken = False
+
+    def _acted(self):
+        """标记「已执行关闭动作」并返回 None（保持原有 return None 契约不变）。"""
+        self.last_action_taken = True
+        return None
 
     @staticmethod
     def _set_foreground(window):
@@ -30,17 +39,20 @@ class PopDialogHandler:
 
     @perf_clock
     def handle(self, title):
+        self.last_action_taken = False
         if any(s in title for s in {"提示信息", "委托确认", "网上交易用户协议", "撤单确认"}):
             self._submit_by_shortcut()
-            return None
+            return self._acted()
 
         if "提示" in title:
             content = self._extract_content()
             self._submit_by_click()
+            self.last_action_taken = True
             return {"message": content}
 
         content = self._extract_content()
         self._close()
+        self.last_action_taken = True
         return {"message": "unknown message: {}".format(content)}
 
     def _extract_content(self):
@@ -114,28 +126,26 @@ class TradePopDialogHandler(PopDialogHandler):
 
     @perf_clock
     def handle(self, title) -> Optional[dict]:
+        self.last_action_taken = False
         if title == "委托确认":
             self._submit_by_shortcut()
-            return None
+            return self._acted()
 
         if title == "提示信息":
             content = self._extract_content()
 
-            for keyword in self._SHORTCUT_KEYWORDS:
-                if keyword in content:
-                    self._submit_by_shortcut()
-                    return None
-
             # ── 2026-10-27 P0 修复 ──────────────────────────────────────
-            # 原实现在此直接 `return None`：既不点按钮也不关窗。
-            # ClientTrader._handle_pop_dialogs 在 `result is None` 且
-            # `visual_oracle` 未接线时循环体等于空操作 ⇒ while 原地空转满
-            # 10 轮才抛 dialog_dismiss_timeout。
-            # 真机实测（sh.603466 200 股）：空转 18.3s（正常基线 6.4s）后委托
-            # 被丢弃，从未到达券商，且无任何告警。
-            screenshot = self._capture_dialog_screenshot(title)
-
+            # ① 验证码判断必须排在白名单**之前**：像「逆回购操作需要输入验证码，
+            #    请重新登录」这类正文会同时命中白名单关键词（逆回购），若先走
+            #    白名单就会向验证码弹窗按 %Y，把熔断整个绕过。
+            # ② 原实现在白名单外直接 `return None`：既不点按钮也不关窗。
+            #    ClientTrader._handle_pop_dialogs 在 `result is None` 且
+            #    `visual_oracle` 未接线时循环体等于空操作 ⇒ while 原地空转满
+            #    10 轮才抛 dialog_dismiss_timeout。
+            #    真机实测（sh.603466 200 股）：空转 18.3s（正常基线 6.4s）后
+            #    委托被丢弃，从未到达券商，且无任何告警。
             if any(keyword in content for keyword in self._CAPTCHA_KEYWORDS):
+                screenshot = self._capture_dialog_screenshot(title)
                 # 验证码/人机校验：点任何按钮都可能被计为一次失败尝试，
                 # ⛔ 不做任何自动操作，立即熔断等待人工处置。
                 raise exceptions.HumanInterventionRequiredError(
@@ -149,14 +159,21 @@ class TradePopDialogHandler(PopDialogHandler):
                     },
                 )
 
+            for keyword in self._SHORTCUT_KEYWORDS:
+                if keyword in content:
+                    self._submit_by_shortcut()
+                    return self._acted()
+
             # 其它未收录内容：留痕 + 尝试点「确定」关闭，把失败语义从
             # 「弹窗无限循环」拉回「未取得合同号」。
+            screenshot = self._capture_dialog_screenshot(title)
             logger.warning(
                 "未收录的提示信息弹窗: title=%r content=%r 截图=%s —— 尝试点击确定关闭",
                 title,
                 content,
                 screenshot or "未落盘",
             )
+            self.last_action_taken = True
             try:
                 self._submit_by_click()
             except Exception as ex:  # noqa: BLE001 关不掉交由上层超时兜底
@@ -169,6 +186,9 @@ class TradePopDialogHandler(PopDialogHandler):
                 "dialog_content": content,
                 "screenshot": screenshot,
                 "unknown_dialog": True,
+                # 该弹窗可能是二次确认类（点确定=继续提交），委托有可能真的发出去了。
+                # 上层拿不到 entrust_no 时应按「提交状态未知」处置，不可当作没提交。
+                "submitted_unknown": True,
             }
 
         if title == "提示":
@@ -176,10 +196,12 @@ class TradePopDialogHandler(PopDialogHandler):
             if "成功" in content:
                 entrust_no = self._extract_entrust_id(content)
                 self._submit_by_click()
+                self.last_action_taken = True
                 return {"entrust_no": entrust_no}
 
             self._submit_by_click()
+            self.last_action_taken = True
             time.sleep(0.05)
             raise exceptions.TradeError(content)
         self._close()
-        return None
+        return self._acted()

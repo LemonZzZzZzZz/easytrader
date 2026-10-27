@@ -248,5 +248,142 @@ class TestDialogEvidenceCapture(unittest.TestCase):
             self.assertTrue(path.endswith(".png"))
 
 
+class _ActingHandler:
+    """模拟「已发 %Y、正在等弹窗消失」的合法慢路径（result 为 None 但已动作）。"""
+
+    calls = 0
+    close_after = 5
+
+    def __init__(self, app):
+        self.last_action_taken = False
+
+    def handle(self, title):
+        type(self).calls += 1
+        # 与真实 TradePopDialogHandler 一致：动作已执行，返回 None
+        self.last_action_taken = True
+        return None
+
+
+class _BrakeHandler:
+    """模拟 handler 直接抛验证码熔断。"""
+
+    def __init__(self, app):
+        self.last_action_taken = False
+
+    def handle(self, title):
+        raise exceptions.HumanInterventionRequiredError(
+            "检测到验证码", result={"message": "captcha_dialog"}
+        )
+
+
+class TestStagnationFalsePositiveGuard(unittest.TestCase):
+    """D1 回归守卫：合法慢确认不得被「无进展」判据误杀。
+
+    父提交 33881c8 下，同一「委托确认」连续 5 轮返回 None 后关闭 ⇒ 成功；
+    若把 `result is None` 直接当作无进展，会在第 5 轮抛 dialog_stagnant，
+    把一笔 %Y 已按下的委托变成确定性失败 —— 代价不对称。
+    """
+
+    def setUp(self):
+        _ActingHandler.calls = 0
+
+    def test_slow_but_legitimate_confirm_is_not_aborted(self):
+        trader = _make_trader()
+        opened = {"n": 0}
+
+        def _still_open():
+            opened["n"] += 1
+            # 前 5 轮弹窗仍在，第 6 轮起消失（= 客户端慢，但最终成功）
+            return opened["n"] <= 5
+
+        with patch.object(trader, "is_exist_pop_dialog", side_effect=_still_open):
+            with patch.object(trader, "_get_pop_dialog_title", return_value="委托确认"):
+                result = trader._handle_pop_dialogs(handler_class=_ActingHandler)
+
+        self.assertEqual(result, {"message": "success"})
+        self.assertEqual(_ActingHandler.calls, 5)
+        self.assertGreater(_ActingHandler.calls, 3)
+
+    def test_acting_handler_gets_full_attempt_budget(self):
+        """已动作但始终关不掉 ⇒ 应走完 10 轮超时，而不是第 5 轮停滞熔断。"""
+        trader = _make_trader()
+        with patch.object(trader, "is_exist_pop_dialog", return_value=True):
+            with patch.object(trader, "_get_pop_dialog_title", return_value="委托确认"):
+                with patch.object(trader, "_capture_dialog_evidence", return_value=""):
+                    with self.assertRaises(exceptions.TradeVerificationError) as ctx:
+                        trader._handle_pop_dialogs(handler_class=_ActingHandler)
+
+        self.assertEqual(ctx.exception.result["message"], "dialog_dismiss_timeout")
+        self.assertEqual(_ActingHandler.calls, 10)
+
+
+class TestBrakeNotSwallowedByVisualArbitration(unittest.TestCase):
+    """D2 回归守卫：接了 visual_oracle 后，验证码熔断不得被视觉分支吞掉。"""
+
+    def test_brake_propagates_when_visual_oracle_present(self):
+        trader = _make_trader()
+        trader.visual_oracle = MagicMock(name="visual_oracle")
+
+        with patch.object(trader, "is_exist_pop_dialog", return_value=True):
+            with patch.object(trader, "_get_pop_dialog_title", return_value="提示信息"):
+                with patch.object(
+                    trader, "_arbitrate_and_dismiss_modal_dialog"
+                ) as arbitrate:
+                    with self.assertRaises(exceptions.HumanInterventionRequiredError):
+                        trader._handle_pop_dialogs(handler_class=_BrakeHandler)
+
+        # 关键：绝不能落到视觉仲裁（那会用概率性 VLM 判定取代确定性熔断）
+        arbitrate.assert_not_called()
+
+
+class TestCaptchaPrecedesWhitelist(unittest.TestCase):
+    """D3 回归守卫：验证码判断必须排在白名单之前。"""
+
+    def test_captcha_mixed_with_whitelist_keyword_still_brakes(self):
+        handler = _make_handler("逆回购操作需要输入验证码，请重新登录")
+        with self.assertRaises(exceptions.HumanInterventionRequiredError):
+            handler.handle("提示信息")
+        handler._submit_by_shortcut.assert_not_called()
+        handler._submit_by_click.assert_not_called()
+
+
+class TestErrorStrNotPolluted(unittest.TestCase):
+    """D4 回归守卫：无参构造时 str(e) 不得变成 'None'。"""
+
+    def test_empty_construction_str_is_empty(self):
+        self.assertEqual(str(exceptions.HumanInterventionRequiredError()), "")
+
+    def test_with_message_and_result(self):
+        exc = exceptions.HumanInterventionRequiredError("boom", result={"a": 1})
+        self.assertEqual(str(exc), "boom")
+        self.assertEqual(exc.result, {"a": 1})
+
+    def test_positional_only_call_still_works(self):
+        """既有调用方（clienttrader / vlm_visual_oracle）只传位置参数。"""
+        exc = exceptions.HumanInterventionRequiredError("检测到图形验证码，触发熔断")
+        self.assertIn("验证码", str(exc))
+
+
+class TestActionFlagContract(unittest.TestCase):
+    """last_action_taken 语义：动作已执行 ⇒ True；纯返回 ⇒ 不置位。"""
+
+    def test_confirm_sets_action_flag(self):
+        handler = _make_handler("随便什么")
+        handler.handle("委托确认")
+        self.assertTrue(handler.last_action_taken)
+
+    def test_unknown_content_sets_action_flag(self):
+        handler = _make_handler("该证券今日停牌")
+        handler.handle("提示信息")
+        self.assertTrue(handler.last_action_taken)
+
+    def test_flag_reset_between_calls(self):
+        handler = _make_handler("该证券今日停牌")
+        handler.handle("提示信息")
+        self.assertTrue(handler.last_action_taken)
+        handler.handle("警告")  # 走 _close() 分支
+        self.assertTrue(handler.last_action_taken)
+
+
 if __name__ == "__main__":
     unittest.main()

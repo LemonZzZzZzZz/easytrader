@@ -19,6 +19,7 @@ from pywinauto import findwindows, timings
 from easytrader import grid_strategies, pop_dialog_handler, refresh_strategies
 from easytrader.config import client
 from easytrader.exceptions import (
+    CircuitBreakerOpenError,
     HumanInterventionRequiredError,
     TradeError,
     TradeVerificationError,
@@ -1401,7 +1402,9 @@ class ClientTrader(IClientTrader):
         handler = handler_class(self._app)
         max_attempts = 10
         # 同标题连续「无进展」轮数上限：超过即提前熔断，不再空转满 10 轮。
-        # 2026-10-27 真机实测：空转 18.3s（正常委托基线 6.4s）后才超时丢单。
+        # 判据是「handler 本轮未执行任何关闭动作」，因此「委托确认」这类
+        # 已发 %Y、正在等弹窗消失的合法慢路径不会被计入（见下方 acted 判定）。
+        # 2026-10-27 真机实测：未知内容弹窗空转 18.3s（正常基线 6.4s）后才超时丢单。
         # 可用 env 覆盖（调试/兼容慢客户端），越界自动收敛到 [1, max_attempts]。
         max_stagnant = _resolve_max_stagnant(max_attempts)
         attempt = 0
@@ -1433,6 +1436,12 @@ class ClientTrader(IClientTrader):
             result = None
             try:
                 result = handler.handle(title)
+            except (HumanInterventionRequiredError, CircuitBreakerOpenError):
+                # ⛔ 熔断类异常必须**直接上抛**：绝不能落到下面的视觉仲裁分支
+                # 被「吞掉 + continue」。否则一旦接了 visual_oracle，验证码弹窗
+                # 会被反复点击（每轮都可能被券商记一次失败尝试）直到 timeout，
+                # 而确定性关键词熔断反倒被概率性的 VLM 判定取代。
+                raise
             except Exception as e:
                 # 弹窗内控件缺失或非标弹窗抛出异常，回退至视觉智能仲裁
                 if getattr(self, "visual_oracle", None) is not None:
@@ -1442,9 +1451,12 @@ class ClientTrader(IClientTrader):
 
             trace.append({"attempt": attempt, "title": title, "result": result})
 
-            # 无进展检测：同标题且 handler 未返回有效结果 ⇒ 循环体等于空操作。
-            # 原实现会一直空转到第 11 轮才抛异常，期间委托状态完全未知。
-            if result is None and title == last_title:
+            # 无进展检测：只有「handler 什么动作都没做，且同标题复现」才算空转。
+            # ⚠️ 不能只看 `result is None`：「委托确认」的成功路径本身就是
+            # return None（%Y 已发出、正在等弹窗消失），把它计入会把「慢但对」
+            # 的委托误杀成确定性失败 —— 而失败发生在 %Y 已按下之后，代价不对称。
+            acted = bool(getattr(handler, "last_action_taken", False))
+            if result is None and not acted and title == last_title:
                 stagnant += 1
             else:
                 stagnant = 0
