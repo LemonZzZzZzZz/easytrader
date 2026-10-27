@@ -60,7 +60,8 @@ class PopDialogHandler:
 
     @staticmethod
     def _extract_entrust_id(content):
-        return re.search(r"[\da-zA-Z]+", content).group()
+        match = re.search(r"[\da-zA-Z]+", content)
+        return match.group() if match else ""
 
     def _submit_by_click(self):
         try:

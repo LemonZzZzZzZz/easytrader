@@ -142,6 +142,15 @@ class TestLegacyBranchesUnchanged(unittest.TestCase):
         self.assertEqual(result["entrust_no"], "12345")
         handler._submit_by_click.assert_called_once()
 
+    def test_tip_success_without_numeric_id_does_not_raise(self):
+        """既有缺陷修复：正文含「成功」但无数字时，不得抛 AttributeError，且必须点击确定关窗。"""
+        handler = _make_handler("您的委托已成功提交。")
+        result = handler.handle("提示")
+        self.assertEqual(result["entrust_no"], "")
+        handler._submit_by_click.assert_called_once()
+        self.assertTrue(handler.last_action_taken)
+
+
     def test_tip_failure_raises_trade_error(self):
         handler = _make_handler("资金不足")
         with self.assertRaises(exceptions.TradeError):
