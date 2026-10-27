@@ -385,5 +385,73 @@ class TestActionFlagContract(unittest.TestCase):
         self.assertTrue(handler.last_action_taken)
 
 
+class TestRealHandlerEndToEnd(unittest.TestCase):
+    """端到端：真实 TradePopDialogHandler 走 _handle_pop_dialogs 的慢确认路径。
+
+    前 5 轮弹窗仍在、第 6 轮消失，模拟客户端慢但最终成功。
+    只 patch GUI 副作用（快捷键/点击/截图/取文本），不替换被测的分支判断与标记逻辑。
+    """
+
+    def test_slow_confirm_through_real_handler_succeeds(self):
+        trader = _make_trader()
+        opened = {"n": 0}
+
+        def _still_open():
+            opened["n"] += 1
+            return opened["n"] <= 5
+
+        trader._app.top_window.return_value.Static.window_text.return_value = "普通确认"
+        with patch.object(TradePopDialogHandler, "_submit_by_shortcut"):
+            with patch.object(TradePopDialogHandler, "_submit_by_click"):
+                with patch.object(
+                    TradePopDialogHandler, "_capture_dialog_screenshot", return_value=""
+                ):
+                    with patch.object(
+                        trader, "is_exist_pop_dialog", side_effect=_still_open
+                    ):
+                        with patch.object(
+                            trader, "_get_pop_dialog_title", return_value="委托确认"
+                        ):
+                            result = trader._handle_pop_dialogs(
+                                handler_class=TradePopDialogHandler
+                            )
+
+        self.assertEqual(result, {"message": "success"})
+        self.assertEqual(opened["n"], 6)
+
+
+class TestExceptionPathsCarryTrace(unittest.TestCase):
+    """视觉仲裁 continue 路径也必须留下 trace，超时异常才能带现场。"""
+
+    def test_trace_populated_when_datadialogs_raise_then_oracle(self):
+        trader = _make_trader()
+        trader.visual_oracle = MagicMock(name="visual_oracle")
+
+        class _RaisingHandler:
+            def __init__(self, app):
+                pass
+
+            def handle(self, title):
+                raise RuntimeError("no control")
+
+        with patch.object(trader, "is_exist_pop_dialog", return_value=True):
+            with patch.object(trader, "_get_pop_dialog_title", return_value="提示信息"):
+                with patch.object(
+                    trader, "_arbitrate_and_dismiss_modal_dialog"
+                ):
+                    with patch.object(
+                        trader, "_capture_dialog_evidence", return_value=""
+                    ):
+                        with self.assertRaises(
+                            exceptions.TradeVerificationError
+                        ) as ctx:
+                            trader._handle_pop_dialogs(handler_class=_RaisingHandler)
+
+        result = ctx.exception.result
+        self.assertEqual(result["message"], "dialog_dismiss_timeout")
+        self.assertEqual(len(result["dialog_trace"]), 10)
+        self.assertIn("raise:RuntimeError", str(result["dialog_trace"][0]["result"]))
+
+
 if __name__ == "__main__":
     unittest.main()

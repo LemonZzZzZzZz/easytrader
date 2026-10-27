@@ -1441,8 +1441,17 @@ class ClientTrader(IClientTrader):
                 # 被「吞掉 + continue」。否则一旦接了 visual_oracle，验证码弹窗
                 # 会被反复点击（每轮都可能被券商记一次失败尝试）直到 timeout，
                 # 而确定性关键词熔断反倒被概率性的 VLM 判定取代。
+                trace.append({"attempt": attempt, "title": title, "result": "brake"})
                 raise
             except Exception as e:
+                # 先记一条轨迹：走视觉仲裁继续轮询时，超时异常要能带上现场
+                trace.append(
+                    {
+                        "attempt": attempt,
+                        "title": title,
+                        "result": "raise:{}".format(type(e).__name__),
+                    }
+                )
                 # 弹窗内控件缺失或非标弹窗抛出异常，回退至视觉智能仲裁
                 if getattr(self, "visual_oracle", None) is not None:
                     self._arbitrate_and_dismiss_modal_dialog()
